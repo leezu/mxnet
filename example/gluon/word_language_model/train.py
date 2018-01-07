@@ -165,8 +165,10 @@ def train():
                 L = L / (args.bptt * args.batch_size)
                 L.backward()
 
-            grads = [p.grad(context) for p in model.collect_params().values()]
-            gluon.utils.clip_global_norm(grads, args.clip)
+            grads = [i.grad(context) for i in model.collect_params().values()]
+            # Here gradient is for the whole batch.
+            # So we multiply max_norm by batch_size and bptt size to balance it.
+            #gluon.utils.clip_global_norm(grads, args.clip * args.bptt * args.batch_size)
 
             trainer.step(1)
             total_L += mx.nd.sum(L).asscalar()

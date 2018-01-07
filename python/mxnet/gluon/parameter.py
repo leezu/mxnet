@@ -97,7 +97,7 @@ class Parameter(object):
     """
     def __init__(self, name, grad_req='write', shape=None, dtype=mx_real_t,
                  lr_mult=1.0, wd_mult=1.0, init=None, allow_deferred_init=False,
-                 differentiable=True):
+                 differentiable=True, stype=None):
         self._var = None
         self._data = None
         self._grad = None
@@ -114,6 +114,7 @@ class Parameter(object):
         self.wd_mult = wd_mult
         self.grad_req = grad_req
         self.init = init
+        self.stype = stype if stype is not None else 'default'
 
     def __repr__(self):
         s = 'Parameter {name} (shape={shape}, dtype={dtype})'
@@ -235,7 +236,7 @@ class Parameter(object):
 
         with autograd.pause():
             if data is None:
-                data = ndarray.zeros(shape=self.shape, dtype=self.dtype,
+                data = ndarray.zeros(shape=self.shape, dtype=self.dtype, stype=self.stype,
                                      ctx=context.cpu())
                 initializer.create(default_init)(
                     initializer.InitDesc(self.name, {'__init__': init}), data)

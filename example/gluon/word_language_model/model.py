@@ -27,8 +27,8 @@ class RNNModel(gluon.Block):
         super(RNNModel, self).__init__(**kwargs)
         with self.name_scope():
             self.drop = nn.Dropout(dropout)
-            self.encoder = nn.Embedding(vocab_size, num_embed,
-                                        weight_initializer=mx.init.Uniform(0.1))
+            self.encoder = nn.SparseEmbedding(vocab_size, num_embed,
+                                              weight_initializer=mx.init.Uniform(0.1))
             if mode == 'rnn_relu':
                 self.rnn = rnn.RNN(num_hidden, num_layers, dropout=dropout,
                                    input_size=num_embed)
