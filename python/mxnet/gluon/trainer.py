@@ -23,6 +23,8 @@ __all__ = ['Trainer']
 from .. import optimizer as opt
 from ..model import _create_kvstore
 from .parameter import ParameterDict, Parameter
+from .. import ndarray as nd
+
 
 class Trainer(object):
     """Applies an `Optimizer` on a set of Parameters. Trainer should
@@ -120,8 +122,13 @@ class Trainer(object):
             for i, param in enumerate(self._params):
                 param_arrays = param.list_data()
                 kvstore.init(i, param_arrays[0])
-                kvstore.pull(i, param_arrays, priority=-i)
-            self._kvstore = kvstore
+                if param.stype == 'row_sparse':
+                    row_ids = nd.arange(param_arrays[0].shape[0])
+                    kvstore.row_sparse_pull(i, param_arrays, priority=-i,
+                                            row_ids=row_ids)
+                else:
+                    kvstore.pull(i, param_arrays, priority=-i)
+                self._kvstore = kvstore
             self._update_on_kvstore = update_on_kvstore
         else:
             self._kvstore = None
@@ -189,11 +196,16 @@ class Trainer(object):
 
             if self._kvstore:
                 self._kvstore.push(i, param.list_grad(), priority=-i)
-                if self._update_on_kvstore:
-                    self._kvstore.pull(i, param.list_data(), priority=-i)
-                    continue
+                if param.stype == 'row_sparse':
+                    param_arrays = param.list_data()
+                    row_ids = nd.arange(param_arrays[0].shape[0])
+                    self._kvstore.row_sparse_pull(i, param_arrays, priority=-i,
+                                                  row_ids=row_ids)
                 else:
-                    self._kvstore.pull(i, param.list_grad(), priority=-i)
+                    self._kvstore.pull(i, param.list_data(), priority=-i)
+
+                if self._update_on_kvstore:
+                    continue
 
             for upd, arr, grad in zip(self._updaters, param.list_data(), param.list_grad()):
                 if not ignore_stale_grad or arr._fresh_grad:
