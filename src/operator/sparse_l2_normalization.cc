@@ -39,6 +39,10 @@ MXNET_ADD_SPARSE_OP_ALIAS(l2_normalization)
   [](const NodeAttrs& attrs) {
     return std::vector<std::string>{"data", "norm"};
   })
+.set_attr<nnvm::FMutateInputs>("FMutateInputs",
+                               [](const nnvm::NodeAttrs &attrs) {
+                                 return std::vector<uint32_t>{1};
+                               })
 .set_attr<nnvm::FInferShape>("FInferShape", SparseL2NormalizationOpShape)
 .set_attr<nnvm::FInferType>("FInferType", SparseL2NormalizationOpType)
 .set_attr<FInferStorageType>("FInferStorageType", SparseL2NormalizationOpStorageType)
