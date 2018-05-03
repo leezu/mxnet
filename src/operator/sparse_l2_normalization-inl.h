@@ -40,7 +40,6 @@ namespace op {
 struct SparseL2NormalizationParam : public dmlc::Parameter<SparseL2NormalizationParam> {
   float eps;
   DMLC_DECLARE_PARAMETER(SparseL2NormalizationParam) {
-    // TODO use eps
     DMLC_DECLARE_FIELD(eps).set_default(1e-10f)
       .describe("A small constant for numerical stability.");
   }
@@ -75,8 +74,6 @@ inline bool SparseL2NormalizationOpStorageType(const nnvm::NodeAttrs &attrs,
                                                std::vector<int> *out_attrs) {
   CHECK_EQ(in_attrs->size(), 2U);
   CHECK_EQ(out_attrs->size(), 1U);
-  const SparseL2NormalizationParam &param =
-      nnvm::get<SparseL2NormalizationParam>(attrs.parsed);
   const int in_stype = in_attrs->at(0);
   int &out_stype = out_attrs->at(0);
   bool dispatched = false;
@@ -95,6 +92,12 @@ inline bool SparseL2NormalizationOpStorageType(const nnvm::NodeAttrs &attrs,
   return dispatched;
 }
 
+template <int req, typename DType> struct mask_too_small_norm_entries_kernel {
+  MSHADOW_XINLINE static void Map(int i, DType *norm, const DType eps) {
+    KERNEL_ASSIGN(norm[i], req, norm[i] > eps ? norm[i] : static_cast<DType>(1.0f));
+  }
+};
+
 template <typename xpu>
 void SparseL2NormalizationOpForwardEx(const nnvm::NodeAttrs &attrs,
                                       const OpContext &ctx,
@@ -112,27 +115,45 @@ void SparseL2NormalizationOpForwardEx(const nnvm::NodeAttrs &attrs,
   const auto out_stype = outputs[0].storage_type();
   if (in_stype == kRowSparseStorage && out_stype == kRowSparseStorage) {
     Stream<xpu> *s = ctx.get_stream<xpu>();
-    const nnvm::dim_t num_indices = inputs[0].storage_shape()[0];
-    MXNET_ASSIGN_REQ_SWITCH(req[0], req_type, {
-      if (req_type == kWriteTo) {
-        outputs[0].CheckAndAlloc({mshadow::Shape1(num_indices)});
-        MSHADOW_IDX_TYPE_SWITCH(outputs[0].aux_type(rowsparse::kIdx), CType, {
-          mshadow::Copy(
-              outputs[0].aux_data(rowsparse::kIdx).FlatTo1D<xpu, CType>(),
-              inputs[0].aux_data(rowsparse::kIdx).FlatTo1D<xpu, CType>(), s);
+
+    if (!inputs[0].storage_initialized()) {
+      FillZerosRspImpl(s, outputs[0]);
+      return;
+    }
+
+    CHECK(inputs[0].storage_shape()[0] == inputs[1].storage_shape()[0])
+        << "data and norm must have same number of rows.";
+    CHECK(inputs[1].storage_shape()[1] == 1) << "norm array should have shape (X, 1)";
+
+    MSHADOW_TYPE_SWITCH(inputs[1].data().type_flag_, DType, {
+      MXNET_ASSIGN_REQ_SWITCH(req[0], req_type, {
+        const nnvm::dim_t num_rows = inputs[1].storage_shape()[0];
+        mxnet_op::Kernel<mask_too_small_norm_entries_kernel<req_type, DType>,
+                         xpu>::Launch(s, num_rows,
+                                      inputs[1].data().dptr<DType>(),
+                                      param.eps);
+
+        if (req_type == kWriteTo) {
+          const nnvm::dim_t num_indices = inputs[0].storage_shape()[0];
+          outputs[0].CheckAndAlloc({mshadow::Shape1(num_indices)});
+          MSHADOW_IDX_TYPE_SWITCH(outputs[0].aux_type(rowsparse::kIdx), CType, {
+            mshadow::Copy(
+                outputs[0].aux_data(rowsparse::kIdx).FlatTo1D<xpu, CType>(),
+                inputs[0].aux_data(rowsparse::kIdx).FlatTo1D<xpu, CType>(), s);
+            const std::vector<TBlob> tblob_inputs = {inputs[0].data(),
+                                                     inputs[1].data()};
+            const std::vector<TBlob> tblob_outputs = {outputs[0].data()};
+            BinaryBroadcastCompute<xpu, op::mshadow_op::div>(
+                attrs, ctx, tblob_inputs, req, tblob_outputs);
+          });
+        } else {
           const std::vector<TBlob> tblob_inputs = {inputs[0].data(),
                                                    inputs[1].data()};
           const std::vector<TBlob> tblob_outputs = {outputs[0].data()};
           BinaryBroadcastCompute<xpu, op::mshadow_op::div>(
               attrs, ctx, tblob_inputs, req, tblob_outputs);
-        });
-      } else {
-        const std::vector<TBlob> tblob_inputs = {inputs[0].data(),
-                                                 inputs[1].data()};
-        const std::vector<TBlob> tblob_outputs = {outputs[0].data()};
-        BinaryBroadcastCompute<xpu, op::mshadow_op::div>(
-            attrs, ctx, tblob_inputs, req, tblob_outputs);
-      }
+        }
+      });
     });
   } else {
     LogUnimplementedOp(attrs, ctx, inputs, req, outputs);
