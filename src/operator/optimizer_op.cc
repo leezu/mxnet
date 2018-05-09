@@ -30,6 +30,7 @@ namespace mxnet {
 namespace op {
 
 DMLC_REGISTER_PARAMETER(SGDParam);
+DMLC_REGISTER_PARAMETER(ProximalSGDParam);
 DMLC_REGISTER_PARAMETER(SGDMomParam);
 DMLC_REGISTER_PARAMETER(FTMLParam);
 DMLC_REGISTER_PARAMETER(AdamParam);
@@ -280,6 +281,59 @@ void AdamStdUpdateDnsRspDnsImpl<cpu>(const AdamParam& param,
 }
 
 /*!
+ * \brief Shape inference function for Proximal SGD.
+ */
+inline bool ProximalSGDShape(const nnvm::NodeAttrs& attrs,
+                             std::vector<TShape>* in_attrs,
+                             std::vector<TShape>* out_attrs) {
+  CHECK_EQ(in_attrs->size(), 3U);
+  CHECK_EQ(out_attrs->size(), 1U);
+
+  SHAPE_ASSIGN_CHECK(*out_attrs, 0, in_attrs->at(0));
+  SHAPE_ASSIGN_CHECK(*out_attrs, 0, in_attrs->at(1));
+  SHAPE_ASSIGN_CHECK(*in_attrs, 0, out_attrs->at(0));
+  SHAPE_ASSIGN_CHECK(*in_attrs, 1, out_attrs->at(0));
+
+  // TODO(leezu): This doesn't do reverse shape inference for aux input
+
+  return out_attrs->at(0).ndim() != 0U && out_attrs->at(0).Size() != 0U &&
+         (in_attrs->at(0)[0] == in_attrs->at(1)[0]) &&
+         (in_attrs->at(0)[0] == in_attrs->at(2)[0]);
+}
+
+/*!
+ * \brief Storge type inference function for SGD.
+ */
+inline bool ProximalSGDStorageType(const nnvm::NodeAttrs& attrs,
+                           const int dev_mask,
+                           DispatchMode* dispatch_mode,
+                           std::vector<int>* in_attrs,
+                           std::vector<int>* out_attrs) {
+  using namespace common;
+  CHECK_EQ(in_attrs->size(), 3U);
+  CHECK_EQ(out_attrs->size(), 1U);
+  const int weight_stype = in_attrs->at(0);
+  const int grad_stype = in_attrs->at(1);
+  CHECK_EQ(in_attrs->at(2), kDefaultStorage);
+  bool dispatched = false;
+  if (!dispatched && ContainsOnlyStorage(*in_attrs, kDefaultStorage)) {
+    // dns, ... -> dns
+    dispatched = storage_type_assign(out_attrs, kDefaultStorage,
+                                     dispatch_mode, DispatchMode::kFCompute);
+  }
+  if (!dispatched && grad_stype == kRowSparseStorage &&
+      (weight_stype == kRowSparseStorage || weight_stype == kDefaultStorage)) {
+    // grad's stype = rsp
+    dispatched = storage_type_assign(out_attrs, static_cast<NDArrayStorageType>(weight_stype),
+                                     dispatch_mode, DispatchMode::kFComputeEx);
+  }
+  if (!dispatched) {
+    dispatched = dispatch_fallback(out_attrs, dispatch_mode);
+  }
+  return dispatched;
+}
+
+/*!
  * \brief Storge type inference function for SGD.
  */
 inline bool SGDStorageType(const nnvm::NodeAttrs& attrs,
@@ -340,6 +394,28 @@ only the row slices whose indices appear in grad.indices are updated::
 .add_argument("weight", "NDArray-or-Symbol", "Weight")
 .add_argument("grad", "NDArray-or-Symbol", "Gradient")
 .add_arguments(SGDParam::__FIELDS__());
+
+// TODO(leezu) Add docstring
+NNVM_REGISTER_OP(proximal_sgd_update)
+MXNET_ADD_SPARSE_OP_ALIAS(proximal_sgd_update)
+.describe(R"code(Update function for Proximal Stochastic Gradient Descent (SDG) optimizer.)code" ADD_FILELINE)
+.set_num_inputs(3)
+.set_num_outputs(1)
+.set_attr_parser(ParamParser<ProximalSGDParam>)
+.set_attr<nnvm::FInferShape>("FInferShape", ProximalSGDShape)
+.set_attr<nnvm::FInferType>("FInferType", ElemwiseType<3, 1>)
+.set_attr<FInferStorageType>("FInferStorageType", ProximalSGDStorageType)
+.set_attr<nnvm::FMutateInputs>("FMutateInputs",
+                               [](const nnvm::NodeAttrs& attrs) {
+                                 return std::vector<uint32_t>{2};
+                               })
+.set_attr<FCompute>("FCompute<cpu>", ProximalSGDUpdate<cpu>)
+.set_attr<FComputeEx>("FComputeEx<cpu>", ProximalSGDUpdateEx<cpu>)
+.add_argument("weight", "NDArray-or-Symbol", "Weight")
+.add_argument("grad", "NDArray-or-Symbol", "Gradient")
+.add_argument("last_update_buffer", "NDArray-or-Symbol", "Last update buffer")
+.add_arguments(ProximalSGDParam::__FIELDS__());
+// TODO(leezu): Introduce axes parameter to specify the groups of group lasso
 
 NNVM_REGISTER_OP(sgd_mom_update)
 MXNET_ADD_SPARSE_OP_ALIAS(sgd_mom_update)

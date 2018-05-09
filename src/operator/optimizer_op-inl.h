@@ -122,6 +122,70 @@ inline void SGDUpdate(const nnvm::NodeAttrs& attrs,
   });
 }
 
+/*! \brief kernel for enforcing group sparsity after sparse sgd update
+ */
+template<int req, typename xpu>
+struct SGDGroupLassoDnsRspKernel {
+  // DType is the output data type
+  // IType is row sparse idx type
+  // i is the ith row in row sparse gradient
+  template <typename DType, typename IType>
+  MSHADOW_XINLINE static void
+  Map(int i, const index_t row_length, DType *out, const DType *weight,
+      const IType *grad_idx, DType *last_update_buffer,
+      const DType current_update, const DType sparsity, const DType lr,
+      const bool lazy_update) {
+
+    auto get_data_i = [&lazy_update, &i, &grad_idx,
+                       &row_length](index_t j) -> index_t {
+      if (lazy_update) {
+        return grad_idx[i] * row_length + j;
+      } else {
+        return i * row_length + j;
+      }
+    };
+
+    // Compute the L2 norm of this row
+    DType sum, residual; // TODO Kahan summation may not be necessary
+    mshadow::red::sum::SetInitValue(sum, residual);
+    for (index_t j = 0; j < row_length; j++) {
+      index_t data_i = get_data_i(j);
+      const DType val = weight[data_i] * weight[data_i];
+      mshadow::red::sum::Reduce(sum, val, residual);
+    }
+    DType norm = std::sqrt(sum);
+
+    // Compute number of weight updates skipped due to lazy_update
+    DType num_skipped;
+    if (lazy_update) {
+      num_skipped = current_update - last_update_buffer[grad_idx[i]];
+      last_update_buffer[grad_idx[i]] = current_update;
+    } else {
+      num_skipped = current_update - last_update_buffer[i];
+      last_update_buffer[i] = current_update;
+    }
+    // Workaround erroneous last_update_buffer
+    if (num_skipped < 1) {
+      num_skipped = 1;
+    }
+    DType scaled_sparsity = sparsity * num_skipped * lr;
+
+    // Soft threshold weights (proximal map for group lasso)
+    if (scaled_sparsity >= norm) {
+      for (index_t j = 0; j < row_length; j++) {
+        index_t data_i = get_data_i(j);
+        KERNEL_ASSIGN(out[data_i], req, 0);
+      }
+    } else {
+      for (index_t j = 0; j < row_length; j++) {
+        index_t data_i = get_data_i(j);
+        KERNEL_ASSIGN(out[data_i], req,
+                      weight[data_i] - scaled_sparsity * weight[data_i] / norm);
+      }
+    }
+  }
+};
+
 /*! \brief kernel for sparse sgd
  */
 template<int req, typename xpu>
@@ -706,6 +770,221 @@ inline void SGDMomUpdateEx(const nnvm::NodeAttrs& attrs,
     LogUnimplementedOp(attrs, ctx, inputs, req, outputs);
   }
 }
+
+struct ProximalSGDParam : public dmlc::Parameter<ProximalSGDParam> {
+  float lr;
+  float rescale_grad;
+  float clip_gradient;
+  float sparsity;
+  float current_update;
+  bool lazy_update;
+  DMLC_DECLARE_PARAMETER(ProximalSGDParam) {
+    DMLC_DECLARE_FIELD(lr).describe("Learning rate");
+    DMLC_DECLARE_FIELD(rescale_grad)
+        .set_default(1.0f)
+        .describe("Rescale gradient to grad = rescale_grad*grad.");
+    DMLC_DECLARE_FIELD(clip_gradient)
+        .set_default(-1.0f)
+        .describe(
+            "Clip gradient to the range of [-clip_gradient, clip_gradient] "
+            "If clip_gradient <= 0, gradient clipping is turned off. "
+            "grad = max(min(grad, clip_gradient), -clip_gradient).");
+    DMLC_DECLARE_FIELD(sparsity).set_default(0.0f).describe(
+        "Lambda term for group lasso objective.");
+    DMLC_DECLARE_FIELD(current_update)
+        .set_default(0.0f)
+        .describe("Current update iteration for lazy update with group lasso "
+                  "objective.");
+    DMLC_DECLARE_FIELD(lazy_update)
+        .set_default(true)
+        .describe("If true, lazy updates are applied if gradient's stype is "
+                  "row_sparse.");
+  }
+};
+
+/*! \brief kernel for enforcing group sparsity after sparse sgd update
+ */
+template <int req, typename xpu> struct ProximalSGDDnsRspKernel {
+  // DType is the output data type
+  // IType is row sparse idx type
+  // i is the ith row in row sparse gradient
+  template <typename DType, typename IType>
+  MSHADOW_XINLINE static void
+  Map(int i, const index_t row_length, DType *out, const DType *weight,
+      const IType *grad_idx, DType *last_update_buffer,
+      const DType current_update, const DType sparsity, const DType lr,
+      const bool lazy_update) {
+
+    auto get_data_i = [&lazy_update, &i, &grad_idx,
+                       &row_length](index_t j) -> index_t {
+      if (lazy_update) {
+        return grad_idx[i] * row_length + j;
+      } else {
+        return i * row_length + j;
+      }
+    };
+
+    // Compute the L2 norm of this row
+    DType sum, residual; // TODO Kahan summation may not be necessary
+    mshadow::red::sum::SetInitValue(sum, residual);
+    for (index_t j = 0; j < row_length; j++) {
+      index_t data_i = get_data_i(j);
+      const DType val = weight[data_i] * weight[data_i];
+      mshadow::red::sum::Reduce(sum, val, residual);
+    }
+    DType norm = std::sqrt(sum);
+
+    // Compute number of weight updates skipped due to lazy_update
+    DType num_skipped;
+    if (lazy_update) {
+      num_skipped = current_update - last_update_buffer[grad_idx[i]];
+      last_update_buffer[grad_idx[i]] = current_update;
+    } else {
+      num_skipped = current_update - last_update_buffer[i];
+      last_update_buffer[i] = current_update;
+    }
+    // Workaround erroneous last_update_buffer
+    if (num_skipped < 1) {
+      num_skipped = 1;
+    }
+    DType scaled_sparsity = sparsity * num_skipped * lr;
+
+    // Soft threshold weights (proximal map for group lasso)
+    if (scaled_sparsity >= norm) {
+      for (index_t j = 0; j < row_length; j++) {
+        index_t data_i = get_data_i(j);
+        KERNEL_ASSIGN(out[data_i], req, 0);
+      }
+    } else {
+      for (index_t j = 0; j < row_length; j++) {
+        index_t data_i = get_data_i(j);
+        KERNEL_ASSIGN(out[data_i], req,
+                      weight[data_i] - scaled_sparsity * weight[data_i] / norm);
+      }
+    }
+  }
+};
+
+/*
+ * \brief SGD update implementation for dense weight and row_sparse grad.
+ *        Both standard update and lazy update are supported.
+ */
+template <typename xpu>
+inline void
+ProximalSGDUpdateDnsRspImpl(const ProximalSGDParam &param, const OpContext &ctx,
+                            const TBlob &weight, const NDArray &grad,
+                            const TBlob &last_update_buffer,
+                            const OpReqType &req, TBlob *out) {
+  using namespace mshadow;
+  using namespace mshadow::expr;
+  using namespace mshadow_op;
+  using namespace mxnet_op;
+  Stream<xpu> *s = ctx.get_stream<xpu>();
+  CHECK_EQ(grad.storage_type(), kRowSparseStorage);
+  CHECK_EQ(grad.storage_type(), kRowSparseStorage);
+  // if gradients are zeros, no weights are updated
+  if (req == kNullOp)
+    return;
+  CHECK_EQ(req, kWriteInplace)
+      << "kWriteInplace is expected for sparse sgd_mom_update";
+  CHECK_GT(weight.shape_.Size(), 0);
+
+  MSHADOW_REAL_TYPE_SWITCH(weight.type_flag_, DType, {
+    MSHADOW_IDX_TYPE_SWITCH(grad.aux_type(rowsparse::kIdx), IType, {
+      MXNET_ASSIGN_REQ_SWITCH(req, req_type, {
+        DType *weight_data = weight.dptr<DType>();
+        const auto row_length = weight.shape_.ProdShape(1, weight.ndim());
+        const IType *grad_idx = grad.aux_data(rowsparse::kIdx).dptr<IType>();
+        const DType *grad_val = grad.data().dptr<DType>();
+        const nnvm::dim_t num_rows = grad.aux_shape(rowsparse::kIdx)[0];
+        size_t num_threads = num_rows;
+
+        if (grad.storage_initialized()) {
+          if (std::is_same<xpu, gpu>::value) {
+            num_threads = num_rows * row_length;
+          }
+          Kernel<SGDDnsRspKernel<req_type, xpu>, xpu>::Launch(
+              s, num_threads, row_length, out->dptr<DType>(), weight_data,
+              grad_idx, grad_val, static_cast<DType>(param.clip_gradient),
+              static_cast<DType>(param.lr), static_cast<DType>(0.0f),
+              static_cast<DType>(param.rescale_grad));
+        }
+        if (param.sparsity > 0.0f) {
+          // When performing eager update, iterate over all rows of the weight
+          // array
+          if (!param.lazy_update) {
+            num_threads = weight.shape_[0];
+          } else if (grad.storage_initialized()) {
+            num_threads = num_rows;
+          } else { // Lazy update with 0 gradient
+            return;
+          }
+
+          // TODO infer the current iteration instead of taking it as param
+          // The iteration of the current update is the max of
+          // last_update_buffer + 1 DType current_update; mshadow::red::maximum
+
+          DType *last_update_data = last_update_buffer.dptr<DType>();
+          Kernel<ProximalSGDDnsRspKernel<req_type, xpu>, xpu>::Launch(
+              s, num_threads, row_length, out->dptr<DType>(), weight_data,
+              grad_idx, last_update_data,
+              static_cast<DType>(param.current_update),
+              static_cast<DType>(param.sparsity), static_cast<DType>(param.lr),
+              param.lazy_update);
+        }
+      });
+    });
+  });
+}
+
+/*
+ * \brief SGD update implementation for row_sparse grad.
+ *        Both standard update and lazy update are supported.
+ */
+template <typename xpu>
+inline void ProximalSGDUpdateRspImpl(const ProximalSGDParam &param,
+                                     const OpContext &ctx,
+                                     const NDArray &weight, const NDArray &grad,
+                                     const NDArray &last_update_buffer,
+                                     const OpReqType &req, NDArray *out) {
+  CheckAllRowsPresent(weight, "SGDUpdate", "weights");
+  // reuse dns rsp implementation when storage_shape == shape
+  TBlob out_blob = out->data();
+  ProximalSGDUpdateDnsRspImpl<xpu>(param, ctx, weight.data(), grad,
+                                   last_update_buffer.data(), req, &out_blob);
+}
+
+template <typename xpu>
+inline void ProximalSGDUpdate(const nnvm::NodeAttrs &attrs,
+                              const OpContext &ctx,
+                              const std::vector<TBlob> &inputs,
+                              const std::vector<OpReqType> &req,
+                              const std::vector<TBlob> &outputs) {
+  CHECK_EQ(0, 1) << "unimplemented";
+}
+
+template <typename xpu>
+inline void ProximalSGDUpdateEx(const nnvm::NodeAttrs &attrs,
+                                const OpContext &ctx,
+                                const std::vector<NDArray> &inputs,
+                                const std::vector<OpReqType> &req,
+                                const std::vector<NDArray> &outputs) {
+  const ProximalSGDParam &param = nnvm::get<ProximalSGDParam>(attrs.parsed);
+  const auto w_stype = inputs[0].storage_type();
+  const auto g_stype = inputs[1].storage_type();
+  const auto o_stype = outputs[0].storage_type();
+  if (o_stype == w_stype && g_stype == kRowSparseStorage &&
+      (w_stype == kDefaultStorage || w_stype == kRowSparseStorage)) {
+    NDArray out = outputs[0];
+    // std update and lazy update with rsp grad
+    ProximalSGDUpdateRspImpl<xpu>(param, ctx, inputs[0], inputs[1], inputs[2],
+                                  req[0], &out);
+  } else {
+    LogUnimplementedOp(attrs, ctx, inputs, req, outputs);
+  }
+}
+
+// TODO LEEZU
 
 
 struct FTMLParam : public dmlc::Parameter<FTMLParam> {
