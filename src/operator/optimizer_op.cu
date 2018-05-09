@@ -232,6 +232,10 @@ NNVM_REGISTER_OP(sgd_update)
 .set_attr<FCompute>("FCompute<gpu>", SGDUpdate<gpu>)
 .set_attr<FComputeEx>("FComputeEx<gpu>", SGDUpdateEx<gpu>);
 
+NNVM_REGISTER_OP(proximal_sgd_update)
+.set_attr<FCompute>("FCompute<gpu>", ProximalSGDUpdate<gpu>)
+.set_attr<FComputeEx>("FComputeEx<gpu>", ProximalSGDUpdateEx<gpu>);
+
 NNVM_REGISTER_OP(sgd_mom_update)
 .set_attr<FCompute>("FCompute<gpu>", SGDMomUpdate<gpu>)
 .set_attr<FComputeEx>("FComputeEx<gpu>", SGDMomUpdateEx<gpu>);
