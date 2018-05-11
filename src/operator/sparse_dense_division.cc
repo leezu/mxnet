@@ -27,27 +27,36 @@
 namespace mxnet {
 namespace op {
 
-
 NNVM_REGISTER_OP(sparse_dense_division)
 MXNET_ADD_SPARSE_OP_ALIAS(dense_division)
-.describe(R"code(This operators divides the rows in the sparse lhs matrix by the values in the rhs vector)code" ADD_FILELINE)
-.set_num_inputs(2)
-.set_num_outputs(1)
-.set_attr<nnvm::FListInputNames>("FListInputNames",
-  [](const NodeAttrs& attrs) {
-    return std::vector<std::string>{"data", "norm"};
-  })
-.set_attr<nnvm::FMutateInputs>("FMutateInputs",
-                               [](const nnvm::NodeAttrs &attrs) {
-                                 return std::vector<uint32_t>{1};
-                               })
-.set_attr<nnvm::FInferShape>("FInferShape", SparseDenseDivisionOpShape)
-.set_attr<nnvm::FInferType>("FInferType", SparseDenseDivisionOpType)
-.set_attr<FInferStorageType>("FInferStorageType", SparseDenseDivisionOpStorageType)
-.set_attr<FCompute>("FCompute<cpu>", BinaryBroadcastCompute<cpu, op::mshadow_op::div>)
-.set_attr<FComputeEx>("FComputeEx<cpu>", SparseDenseDivisionOpForwardEx<cpu>)
-.add_argument("matrix", "NDArray-or-Symbol", "Input 2D matrix")
-.add_argument("vector", "NDArray-or-Symbol", "Input 1D vector");
+    .describe(
+        R"code(This operators divides the rows in the sparse lhs matrix by the values in the rhs vector)code" ADD_FILELINE)
+    .set_num_inputs(2)
+    .set_num_outputs(1)
+    .set_attr<nnvm::FListInputNames>(
+        "FListInputNames",
+        [](const NodeAttrs &attrs) {
+          return std::vector<std::string>{"data", "norm"};
+        })
+    .set_attr<nnvm::FMutateInputs>("FMutateInputs",
+                                   [](const nnvm::NodeAttrs &attrs) {
+                                     return std::vector<uint32_t>{1};
+                                   })
+    .set_attr<FResourceRequest>("FResourceRequest",
+                                [](const NodeAttrs &attrs) {
+                                  return std::vector<ResourceRequest>{
+                                      ResourceRequest::kTempSpace};
+                                })
+    .set_attr<nnvm::FInferShape>("FInferShape", SparseDenseDivisionOpShape)
+    .set_attr<nnvm::FInferType>("FInferType", SparseDenseDivisionOpType)
+    .set_attr<FInferStorageType>("FInferStorageType",
+                                 SparseDenseDivisionOpStorageType)
+    .set_attr<FCompute>("FCompute<cpu>",
+                        BinaryBroadcastCompute<cpu, op::mshadow_op::div>)
+    .set_attr<FComputeEx>("FComputeEx<cpu>",
+                          SparseDenseDivisionOpForwardEx<cpu>)
+    .add_argument("matrix", "NDArray-or-Symbol", "Input 2D matrix")
+    .add_argument("vector", "NDArray-or-Symbol", "Input 1D vector");
 
-}  // namespace op
-}  // namespace mxnet
+} // namespace op
+} // namespace mxnet
