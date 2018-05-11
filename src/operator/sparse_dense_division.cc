@@ -18,21 +18,19 @@
  */
 
 /*!
- * \file sparse_l2_normalization_op.cc
- * \brief CPU Implementation of sparse_l2_normalization op
+ * \file sparse_dense_division_op.cc
+ * \brief CPU Implementation of sparse_dense_division op
  */
-#include "./sparse_l2_normalization-inl.h"
+#include "./sparse_dense_division-inl.h"
 #include "./tensor/elemwise_binary_broadcast_op.h"
 
 namespace mxnet {
 namespace op {
 
-DMLC_REGISTER_PARAMETER(SparseL2NormalizationParam);
 
-NNVM_REGISTER_OP(sparse_l2_normalization)
-MXNET_ADD_SPARSE_OP_ALIAS(l2_normalization)
-.describe(R"code(This operators implements the sparse_l2_normalization function)code" ADD_FILELINE)
-.set_attr_parser(ParamParser<SparseL2NormalizationParam>)
+NNVM_REGISTER_OP(sparse_dense_division)
+MXNET_ADD_SPARSE_OP_ALIAS(dense_division)
+.describe(R"code(This operators divides the rows in the sparse lhs matrix by the values in the rhs vector)code" ADD_FILELINE)
 .set_num_inputs(2)
 .set_num_outputs(1)
 .set_attr<nnvm::FListInputNames>("FListInputNames",
@@ -43,14 +41,13 @@ MXNET_ADD_SPARSE_OP_ALIAS(l2_normalization)
                                [](const nnvm::NodeAttrs &attrs) {
                                  return std::vector<uint32_t>{1};
                                })
-.set_attr<nnvm::FInferShape>("FInferShape", SparseL2NormalizationOpShape)
-.set_attr<nnvm::FInferType>("FInferType", SparseL2NormalizationOpType)
-.set_attr<FInferStorageType>("FInferStorageType", SparseL2NormalizationOpStorageType)
+.set_attr<nnvm::FInferShape>("FInferShape", SparseDenseDivisionOpShape)
+.set_attr<nnvm::FInferType>("FInferType", SparseDenseDivisionOpType)
+.set_attr<FInferStorageType>("FInferStorageType", SparseDenseDivisionOpStorageType)
 .set_attr<FCompute>("FCompute<cpu>", BinaryBroadcastCompute<cpu, op::mshadow_op::div>)
-.set_attr<FComputeEx>("FComputeEx<cpu>", SparseL2NormalizationOpForwardEx<cpu>)
-.add_argument("data", "NDArray-or-Symbol", "Input ndarray")
-.add_argument("norm", "NDArray-or-Symbol", "Norm ndarray")
-.add_arguments(SparseL2NormalizationParam::__FIELDS__());
+.set_attr<FComputeEx>("FComputeEx<cpu>", SparseDenseDivisionOpForwardEx<cpu>)
+.add_argument("matrix", "NDArray-or-Symbol", "Input 2D matrix")
+.add_argument("vector", "NDArray-or-Symbol", "Input 1D vector");
 
 }  // namespace op
 }  // namespace mxnet
