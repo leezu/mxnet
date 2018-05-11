@@ -18,18 +18,18 @@
  */
 
 /*!
- * \file sparse_l2_normalization_op.cu
- * \brief GPU Implementation of sparse_l2_normalization op
+ * \file sparse_dense_division_op.cu
+ * \brief GPU Implementation of sparse_dense_division op
  */
-#include "./sparse_l2_normalization-inl.h"
+#include "./sparse_dense_division-inl.h"
 #include "./tensor/elemwise_binary_broadcast_op.h"
 
 namespace mxnet {
 namespace op {
 
-NNVM_REGISTER_OP(sparse_l2_normalization)
+NNVM_REGISTER_OP(sparse_dense_division)
 .set_attr<FCompute>("FCompute<gpu>", BinaryBroadcastCompute<cpu, op::mshadow_op::div>)
-.set_attr<FComputeEx>("FComputeEx<gpu>", SparseL2NormalizationOpForwardEx<gpu>);
+.set_attr<FComputeEx>("FComputeEx<gpu>", SparseDenseDivisionOpForwardEx<gpu>);
 
 }  // namespace op
 }  // namespace mxnet
