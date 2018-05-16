@@ -19,7 +19,7 @@
 # pylint: disable= arguments-differ
 """Basic neural network layers."""
 __all__ = ['Sequential', 'HybridSequential', 'Dense', 'Dropout', 'Embedding',
-           'BatchNorm', 'InstanceNorm', 'LayerNorm', 'Flatten', 'Lambda', 'HybridLambda']
+           'BatchNorm', 'InstanceNorm', 'LayerNorm', 'Flatten', 'Lambda', 'HybridLambda',  'SparseEmbedding']
 import warnings
 import numpy as np
 
@@ -364,6 +364,49 @@ class BatchNorm(HybridBlock):
         return s.format(name=self.__class__.__name__,
                         content=', '.join(['='.join([k, v.__repr__()])
                                            for k, v in self._kwargs.items()]))
+
+
+class SparseEmbedding(HybridBlock):
+    r"""Turns non-negative integers (indexes/tokens) into dense vectors
+    of fixed size. eg. [[4], [20]] -> [[0.25, 0.1], [0.6, -0.2]]
+
+
+    Parameters
+    ----------
+    input_dim : int
+        Size of the vocabulary, i.e. maximum integer index + 1.
+    output_dim : int
+        Dimension of the dense embedding.
+    dtype : str or np.dtype, default 'float32'
+        Data type of output embeddings.
+    weight_initializer : Initializer
+        Initializer for the `embeddings` matrix.
+
+
+    Inputs:
+        - **data**: 2D tensor with shape: `(x1, x2)`.
+
+    Output:
+        - **out**: 3D tensor with shape: `(x1, x2, output_dim)`.
+    """
+    def __init__(self, input_dim, output_dim, dtype='float32',
+                 weight_initializer=None, **kwargs):
+        super(SparseEmbedding, self).__init__(**kwargs)
+        self._kwargs = {'input_dim': input_dim, 'output_dim': output_dim,
+                        'dtype': dtype}
+        self.weight = self.params.get('weight', shape=(input_dim, output_dim),
+                                      init=weight_initializer,
+                                      allow_deferred_init=True,
+                                      grad_stype='row_sparse',
+                                      stype='row_sparse')
+
+    def hybrid_forward(self, F, x, weight):
+        return F.contrib.SparseEmbedding(x, weight, name='fwd', **self._kwargs)
+
+    def __repr__(self):
+        s = '{block_name}({input_dim} -> {output_dim}, {dtype})'
+        return s.format(block_name=self.__class__.__name__,
+                        **self._kwargs)
 
 
 class Embedding(HybridBlock):
