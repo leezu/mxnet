@@ -105,9 +105,11 @@ template <typename xpu> struct sparse_div_lhs_rhs_index_map_kernel {
         lhs_pointer++;
         continue;
       } else {
-        // inputs[1] has an element missing in inputs[0]
-        // which is unsupported
-        break; // TODO report error
+        // TODO
+        // std::cout << "inputs[1] has an element missing in inputs[0] "
+        //           << "which is unsupported. "
+        //           << "In sparse_div_lhs_rhs_index_map_kernel";
+        break;
       }
     }
 
@@ -115,11 +117,12 @@ template <typename xpu> struct sparse_div_lhs_rhs_index_map_kernel {
     // lhs
     if (rhs_pointer < rhs_num_indices) {
       // Exited loopprematurely: Ran out of indices on lhs
-      // TODO report error. For now write invalid entries, that should force a
-      // crash
-      for (index_t rhs_pointer = 0; rhs_pointer < rhs_num_indices;
-           rhs_pointer++) {
-        rhs_idx_lhs_idx_map[rhs_pointer] = -1;
+      // TODO
+      // std::cout << "Setting remaining pointers to 0. "
+      //           << "This is an invalid operation. "
+      //           << "Debug the program!";
+      for (; rhs_pointer < rhs_num_indices; rhs_pointer++) {
+        rhs_idx_lhs_idx_map[rhs_pointer] = 0;
       }
     }
   }
