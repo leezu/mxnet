@@ -152,11 +152,28 @@ class GPUPooledRoundedStorageManager final : public StorageManager {
    */
   GPUPooledRoundedStorageManager() {
     reserve_ = dmlc::GetEnv("MXNET_GPU_MEM_POOL_RESERVE", 5);
-    min_chunk_ = dmlc::GetEnv("MXNET_GPU_MEM_POOL_LOG2_MIN_CHUNK", 5);
-    if (min_chunk_ < 5) {
-      LOG(FATAL) << "MXNET_GPU_MEM_POOL_LOG2_MIN_CHUNK cannot be set to a value smaller than 5. " \
-                 << "Got " << min_chunk_ << ".";
+    min_chunk_ = dmlc::GetEnv("MXNET_GPU_MEM_POOL_MIN_CHUNK", 4096);
+    cut_off_ = dmlc::GetEnv("MXNET_GPU_MEM_POOL_ROUND_LINEAR_CUTOFF", 24);
+    if (min_chunk_ < 32) {
+      LOG(FATAL) << "MXNET_GPU_MEM_POOL_MIN_CHUNK cannot be set to a value smaller than 32. " \
+                 << "Got: " << min_chunk_ << ".";
     }
+    if (min_chunk_ != 1ul << log2_round_up(min_chunk_)) {
+      LOG(FATAL) << "MXNET_GPU_MEM_POOL_MIN_CHUNK must be a power of 2. Got: " << min_chunk_ << ".";
+    } else {
+      min_chunk_ = log2_round_up(min_chunk_);
+    }
+    if (cut_off_ < 20 || cut_off_ > LOG2_MAX_MEM) {
+      LOG(FATAL) << "MXNET_GPU_MEM_POOL_ROUND_LINEAR_CUTOFF cannot be set to a value " \
+                 << "smaller than 20 or greater than " << LOG2_MAX_MEM << ". Got: " \
+                 << cut_off_ << ".";
+    }
+    if (cut_off_ < min_chunk_) {
+      LOG(FATAL) << "MXNET_GPU_MEM_POOL_ROUND_LINEAR_CUTOFF cannot be set to a value " \
+                 << "smaller than log2 of MXNET_GPU_MEM_POOL_MIN_CHUNK. Got: " \
+                 << cut_off_ << " vs " << min_chunk_ << ".";
+    }
+    memory_pool_ = std::vector<std::vector<void*>>((1ul << (LOG2_MAX_MEM - cut_off_)) + cut_off_);
   }
   /*!
    * \brief Default destructor.
@@ -169,7 +186,7 @@ class GPUPooledRoundedStorageManager final : public StorageManager {
   void Free(Storage::Handle handle) override;
 
   void DirectFree(Storage::Handle handle) override {
-    handle.size = 1ul << log2_round_up(handle.size);
+    handle.size = get_size(get_bucket(handle.size));
     std::lock_guard<std::mutex> lock(Storage::Get()->GetMutex(Context::kGPU));
     DirectFreeNoLock(handle);
   }
@@ -219,16 +236,43 @@ class GPUPooledRoundedStorageManager final : public StorageManager {
 
 #if defined(__clang__) || defined(__GNUC__) || defined(__WINDOWS__)
   inline int log2_round_up(size_t s) {
-    int fls = clz(s);  // find last set
-    // must be bigger than min_chunk_ (which is at least 32 for nccl scatter)
-    return std::max(static_cast<int>(min_chunk_), (addr_width-fls) + ((ctz(s) < fls - 1)?1:0));
+    int result = addr_width - 1 - clz(s);
+    return result + ((ctz(s) < result)?1:0);
+  }
+  inline int div_pow2_round_up(size_t s, int divisor_log2) {
+    // (1025, 10) -> 2
+    // (2048, 10) -> 2
+    // (2049, 10) -> 3
+    int ffs = ctz(s);  // find first set
+    return (s >> divisor_log2) + (ffs < divisor_log2 ? 1 : 0);
   }
 #else
   inline int log2_round_up(size_t s) {
-    return std::max(static_cast<int>(min_chunk_),
-                    static_cast<int>(std::ceil(std::log2(s))));
+    return static_cast<int>(std::ceil(std::log2(s)));
+  }
+  inline int div_pow2_round_up(size_t s, int divisor_log2) {
+    // (1025, 10) -> 2
+    // (2048, 10) -> 2
+    // (2049, 10) -> 3
+    int divisor = std::pow(2, divisor_log2);
+    return s / divisor + (s % divisor ? 1 : 0);
   }
 #endif  // defined(__clang__) || defined(__GNUC__) || defined(__WINDOWS__)
+  inline int get_bucket(size_t s) {
+    int log_size = log2_round_up(s);
+    if (log_size > static_cast<int>(cut_off_))
+      return div_pow2_round_up(s, cut_off_) - 1 + cut_off_;
+    else
+      return std::max(log_size, static_cast<int>(min_chunk_));
+  }
+
+  inline size_t get_size(int bucket) {
+    if (bucket <= static_cast<int>(cut_off_))
+      return 1ul << bucket;
+    else
+      return (bucket - cut_off_ + 1) * (1ul << cut_off_);
+  }
+
   void DirectFreeNoLock(Storage::Handle handle) {
     cudaError_t err = cudaFree(handle.dptr);
     // ignore unloading error, as memory has already been recycled
@@ -242,20 +286,21 @@ class GPUPooledRoundedStorageManager final : public StorageManager {
   void ReleaseAll();
   // number of devices
   const int NDEV = 32;
+  const size_t LOG2_MAX_MEM = 34;
   static const int addr_width = sizeof(size_t) * 8;
   // used memory
-  size_t used_memory_ = 0, min_chunk_;
+  size_t used_memory_ = 0, min_chunk_, cut_off_;
   // percentage of reserved memory
   int reserve_;
   // memory pool
-  std::array<std::vector<void*>, addr_width> memory_pool_;
+  std::vector<std::vector<void*>> memory_pool_;
   DISALLOW_COPY_AND_ASSIGN(GPUPooledRoundedStorageManager);
 };  // class GPUPooledRoundedStorageManager
 
 void GPUPooledRoundedStorageManager::Alloc(Storage::Handle* handle) {
-  int log2_size = log2_round_up(handle->size);
-  size_t size = 1ul << log2_size;
-  auto&& reuse_pool = memory_pool_[log2_size];
+  int bucket = get_bucket(handle->size);
+  size_t size = get_size(bucket);
+  auto&& reuse_pool = memory_pool_[bucket];
   std::lock_guard<std::mutex> lock(Storage::Get()->GetMutex(Context::kGPU));
   if (reuse_pool.size() == 0) {
     size_t free, total;
@@ -278,8 +323,8 @@ void GPUPooledRoundedStorageManager::Alloc(Storage::Handle* handle) {
 }
 
 void GPUPooledRoundedStorageManager::Free(Storage::Handle handle) {
-  int log2_size = log2_round_up(handle.size);
-  auto&& reuse_pool = memory_pool_[log2_size];
+  int bucket = get_bucket(handle.size);
+  auto&& reuse_pool = memory_pool_[bucket];
   std::lock_guard<std::mutex> lock(Storage::Get()->GetMutex(Context::kGPU));
   reuse_pool.push_back(handle.dptr);
 }
@@ -287,7 +332,7 @@ void GPUPooledRoundedStorageManager::Free(Storage::Handle handle) {
 void GPUPooledRoundedStorageManager::ReleaseAll() {
   Storage::Handle handle;
   for (size_t i = 0; i < memory_pool_.size(); i++) {
-    handle.size = 1ul << i;
+    handle.size = get_size(i);
     for (auto& j : memory_pool_[i]) {
       handle.dptr = j;
       DirectFreeNoLock(handle);
