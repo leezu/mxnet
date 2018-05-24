@@ -92,7 +92,7 @@ class GPUPooledStorageManager final : public StorageManager {
   // percentage of reserved memory
   int reserve_;
   // number of devices
-  const int NDEV = 32;
+  const size_t NDEV = 32;
   // memory pool
   std::unordered_map<size_t, std::vector<void*>> memory_pool_;
   DISALLOW_COPY_AND_ASSIGN(GPUPooledStorageManager);
@@ -175,12 +175,60 @@ class GPUPooledRoundedStorageManager final : public StorageManager {
   }
 
  private:
-  inline int log2_round_up(size_t s) {
-    int fls = __builtin_clzl(s);  // find last set
+#if __SIZEOF_SIZE_T__ == __SIZEOF_LONG__
 
-    // must be bigger than min_chunk_ (which is at least 32 for nccl scatter)
-    return std::max(min_chunk_, (64-fls) + ((__builtin_ctzl(s) < fls - 1)?1:0));
+#if defined(__clang__) || defined(__GNUC__)
+#define clz(x) __builtin_clzl(x)
+#define ctz(x) __builtin_ctzl(x)
+
+#elif defined(__WINDOWS__)
+#define clz(x) __lzcnt64(x)
+  uint64_t __inline ctz(uint64_t value) {
+    QWORD trailing_zero = 0;
+    _BitScanForward64(&trailing_zero, value)
+    return trailing_zero;
   }
+  uint64_t __inline clz(uint64_t value) {
+    QWORD leading_zero = 0;
+    _BitScanReverse64(&leading_zero, value)
+    return 63 - leading_zero;
+  }
+
+#endif  // defined(__clang__) || defined(__GNUC__)
+
+#elif __SIZEOF_SIZE_T__ == __SIZEOF_INT__
+
+#if defined(__clang__) || defined(__GNUC__) || defined(__WINDOWS__)
+#define clz(x) __builtin_clz(x)
+#define ctz(x) __builtin_ctz(x)
+
+#elif defined(__WINDOWS__)
+  uint32_t __inline clz(uint32_t value) {
+    DWORD leading_zero = 0;
+    _BitScanReverse(&leading_zero, value)
+    return 31 - leading_zero;
+  }
+  uint32_t __inline ctz(uint32_t value) {
+    DWORD trailing_zero = 0;
+    _BitScanForward(&trailing_zero, value)
+    return trailing_zero;
+  }
+
+#endif  // defined(__clang__) || defined(__GNUC__)
+#endif  // __SIZEOF_SIZE_T__
+
+#if defined(__clang__) || defined(__GNUC__) || defined(__WINDOWS__)
+  inline int log2_round_up(size_t s) {
+    int fls = clz(s);  // find last set
+    // must be bigger than min_chunk_ (which is at least 32 for nccl scatter)
+    return std::max(static_cast<int>(min_chunk_), (addr_width-fls) + ((ctz(s) < fls - 1)?1:0));
+  }
+#else
+  inline int log2_round_up(size_t s) {
+    return std::max(static_cast<int>(min_chunk_),
+                    static_cast<int>(std::ceil(std::log2(s))));
+  }
+#endif  // defined(__clang__) || defined(__GNUC__) || defined(__WINDOWS__)
   void DirectFreeNoLock(Storage::Handle handle) {
     cudaError_t err = cudaFree(handle.dptr);
     // ignore unloading error, as memory has already been recycled
@@ -194,12 +242,13 @@ class GPUPooledRoundedStorageManager final : public StorageManager {
   void ReleaseAll();
   // number of devices
   const int NDEV = 32;
+  static const int addr_width = sizeof(size_t) * 8;
   // used memory
-  size_t used_memory_ = 0;
+  size_t used_memory_ = 0, min_chunk_;
   // percentage of reserved memory
-  int reserve_, min_chunk_;
+  int reserve_;
   // memory pool
-  std::array<std::vector<void*>, 64> memory_pool_;
+  std::array<std::vector<void*>, addr_width> memory_pool_;
   DISALLOW_COPY_AND_ASSIGN(GPUPooledRoundedStorageManager);
 };  // class GPUPooledRoundedStorageManager
 
