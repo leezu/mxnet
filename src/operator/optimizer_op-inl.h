@@ -2037,6 +2037,330 @@ inline void AdagradUpdateEx(const nnvm::NodeAttrs& attrs,
   }
 }
 
+struct ProximalAdagradParam : public dmlc::Parameter<ProximalAdagradParam> {
+  float lr;
+  float float_stable_epsilon;
+  float bisection_epsilon;
+  float rescale_grad;
+  float clip_gradient;
+  float l2_regularization_strength;
+  float current_update;
+  bool lazy_update;
+  DMLC_DECLARE_PARAMETER(ProximalAdagradParam) {
+    DMLC_DECLARE_FIELD(lr).describe("Learning rate");
+    DMLC_DECLARE_FIELD(rescale_grad)
+        .set_default(1.0f)
+        .describe("Rescale gradient to grad = rescale_grad*grad.");
+    DMLC_DECLARE_FIELD(clip_gradient)
+        .set_default(-1.0f)
+        .describe(
+            "Clip gradient to the range of [-clip_gradient, clip_gradient] "
+            "If clip_gradient <= 0, gradient clipping is turned off. "
+            "grad = max(min(grad, clip_gradient), -clip_gradient).");
+    DMLC_DECLARE_FIELD(l2_regularization_strength)
+        .set_default(0.0f)
+        .describe("Lambda term for group lasso objective.");
+    DMLC_DECLARE_FIELD(float_stable_epsilon)
+      .set_default(1.0e-5)
+      .describe("Epsilon for numerical stability");
+    DMLC_DECLARE_FIELD(bisection_epsilon)
+      .set_default(1.0)
+      .describe("Epsilon for bisection algorithm for group sparsity.");
+    DMLC_DECLARE_FIELD(current_update)
+        .set_default(0.0f)
+        .describe("Current update iteration for lazy update with group lasso "
+                  "objective.");
+    DMLC_DECLARE_FIELD(lazy_update)
+        .set_default(true)
+        .describe("If true, lazy updates are applied if gradient's stype is "
+                  "row_sparse.");
+  }
+};
+
+inline bool ProximalAdagradStorageType(const nnvm::NodeAttrs &attrs,
+                                       const int dev_mask,
+                                       DispatchMode *dispatch_mode,
+                                       std::vector<int> *in_attrs,
+                                       std::vector<int> *out_attrs) {
+  CHECK_EQ(in_attrs->size(), 4U);
+  CHECK_EQ(out_attrs->size(), 1U);
+  const int weight_stype = in_attrs->at(0);
+  const int grad_stype = in_attrs->at(1);
+  const int state_stype = in_attrs->at(2);
+  CHECK_EQ(in_attrs->at(3), kDefaultStorage); // last update counter
+  bool dispatched = false;
+  if (!dispatched && common::ContainsOnlyStorage(*in_attrs, kDefaultStorage)) {
+    // dns, ... -> dns
+    dispatched = storage_type_assign(out_attrs, kDefaultStorage, dispatch_mode,
+                                     DispatchMode::kFCompute);
+  }
+  if (!dispatched && grad_stype == kRowSparseStorage &&
+      (weight_stype == kRowSparseStorage || weight_stype == kDefaultStorage) &&
+      (state_stype == kRowSparseStorage || state_stype == kDefaultStorage)) {
+    // rsp, rsp, rsp, dense -> rsp
+    dispatched = storage_type_assign(out_attrs, kRowSparseStorage,
+                                     dispatch_mode, DispatchMode::kFComputeEx);
+  }
+  return dispatched;
+}
+
+/*! \brief kernel for enforcing group sparsity after sparse adagrad update
+ */
+template <typename xpu> struct ProximalAdagradDnsRspKernel {
+  // DType is the output data type
+  // IType is row sparse idx type
+  // i is the ith row in row sparse gradient
+  template <typename DType, typename IType>
+  MSHADOW_XINLINE static void
+  Map(int i, const index_t row_length, DType *out, DType *state,
+      const IType *grad_idx, DType *last_update_buffer,
+      const DType current_update, const DType sparsity, const DType lr,
+      const DType float_stable_epsilon, const DType bisection_epsilon,
+      const bool lazy_update) {
+    using namespace mshadow_op;
+
+    auto get_data_i = [&lazy_update, &i, &grad_idx,
+                       &row_length](index_t j) -> index_t {
+      if (lazy_update) {
+        return grad_idx[i] * row_length + j;
+      } else {
+        return i * row_length + j;
+      }
+    };
+
+    // Compute the L2 norm of this row
+    // TODO Kahan summation may not be necessary
+    DType sum, residual;
+    mshadow::red::sum::SetInitValue(sum, residual);
+    for (index_t j = 0; j < row_length; j++) {
+      index_t data_i = get_data_i(j);
+      const DType val = out[data_i] * out[data_i];
+      mshadow::red::sum::Reduce(sum, val, residual);
+    }
+    DType norm = std::sqrt(sum);
+
+    // Compute number of weight updates skipped due to lazy_update
+    DType num_skipped;
+    if (lazy_update) {
+      num_skipped = current_update - last_update_buffer[grad_idx[i]];
+      last_update_buffer[grad_idx[i]] = current_update;
+    } else {
+      num_skipped = current_update - last_update_buffer[i];
+      last_update_buffer[i] = current_update;
+    }
+    // Workaround erroneous last_update_buffer
+    if (num_skipped < 1) {
+      num_skipped = 1;
+    }
+    DType scaled_sparsity = sparsity * num_skipped * lr;
+
+    // Soft threshold weights (proximal map for group lasso)
+    if (scaled_sparsity >= norm) {
+      for (index_t j = 0; j < row_length; j++) {
+        index_t data_i = get_data_i(j);
+        out[data_i] = 0;
+      }
+    } else {
+      // Find θ with Algorithm 4 of Dutchi 2011 paper
+      DType sigma_min, sigma_max;
+      mshadow::red::minimum::SetInitValue(sigma_min);
+      mshadow::red::maximum::SetInitValue(sigma_max);
+      for (index_t j = 0; j < row_length; j++) {
+        index_t data_i = get_data_i(j);
+        mshadow::red::minimum::Reduce(
+            sigma_min, square_root::Map(state[data_i] + float_stable_epsilon));
+        mshadow::red::maximum::Reduce(
+            sigma_max, square_root::Map(state[data_i] + float_stable_epsilon));
+      }
+
+      // TODO(leezu) theta_max < theta_min for small σ
+      DType theta_min =
+          (norm / scaled_sparsity) - (1 / (sigma_max + float_stable_epsilon));
+      DType theta_max =
+          (norm / scaled_sparsity) - (1 / (sigma_min + float_stable_epsilon));
+
+      // if (theta_min > 0 && theta_max > 0) {
+      DType loop_counter = 0;
+      DType theta;
+      do {
+        loop_counter += 1;
+        theta = theta_max / 2.0 + theta_min / 2.0;
+
+        // Compute ||α(θ)||₂
+        // TODO Kahan summation may not be necessary
+        DType alpha_square_sum, alpha_residual;
+        mshadow::red::sum::SetInitValue(alpha_square_sum, alpha_residual);
+        for (index_t j = 0; j < row_length; j++) {
+          index_t data_i = get_data_i(j);
+          const DType val =
+              out[data_i] /
+              (theta +
+               1 / square_root::Map(state[data_i] + float_stable_epsilon));
+          mshadow::red::sum::Reduce(alpha_square_sum, val * val, residual);
+        }
+        DType alpha_norm = std::sqrt(alpha_square_sum);
+
+        // std::printf(
+        //     "Proximal adagrad - sigma_min: %f\tsigma_max %f\ttheta_min: "
+        //     "%f\ttheta_max: %f\talpha_norm: %f\tbisection eps: %f\tloop %f\n",
+        //     sigma_min, sigma_max, theta_min, theta_max, alpha_norm,
+        //     bisection_epsilon, loop_counter);
+        if (alpha_norm > scaled_sparsity) {
+          theta_min = theta;
+        } else {
+          theta_max = theta;
+        }
+        // rescale bisection_epsilon to reasonable value based on magnitude of
+        // theta_max due to exponantial distance of ULP for float
+      } while (std::abs(theta_max - theta_min) >
+               (bisection_epsilon * std::abs(theta_max)));
+
+      for (index_t j = 0; j < row_length; j++) {
+        index_t data_i = get_data_i(j);
+        out[data_i] =
+            out[data_i] -
+            num_skipped * lr * out[data_i] /
+                (1 + (theta *
+                      square_root::Map(state[data_i] + float_stable_epsilon)));
+      }
+      // } else {
+      //   // Invalid theta, ignore adaptive learning rate
+
+      // for (index_t j = 0; j < row_length; j++) {
+      //   index_t data_i = get_data_i(j);
+      //   out[data_i] = out[data_i] - (scaled_sparsity * out[data_i] / norm);
+      // }
+      // }
+    }
+  }
+};
+
+/*
+ * \brief Adagrad update implementation for dense weight and row_sparse grad.
+ *        Both standard update and lazy update are supported.
+ */
+template <typename xpu>
+inline void ProximalAdagradUpdateDnsRspImpl(
+    const ProximalAdagradParam &param, const OpContext &ctx,
+    const TBlob &weight, const NDArray &grad, const TBlob &state,
+    const TBlob &last_update_buffer, const OpReqType &req, TBlob *out) {
+  using namespace mshadow;
+  using namespace mshadow::expr;
+  using namespace mshadow_op;
+  using namespace mxnet_op;
+  Stream<xpu> *s = ctx.get_stream<xpu>();
+  CHECK_EQ(grad.storage_type(), kRowSparseStorage);
+  // if gradients are zeros, no weights are updated
+  if (req == kNullOp) {
+    // TODO(leezu) support eager update
+    CHECK_EQ(param.lazy_update, true);
+    return;
+  }
+  CHECK_EQ(req, kWriteInplace)
+      << "kWriteInplace is expected for sparse proximal_adagrad_update";
+  CHECK_GT(weight.shape_.Size(), 0);
+  CHECK_GT(state.shape_.Size(), 0);
+
+  MSHADOW_REAL_TYPE_SWITCH(weight.type_flag_, DType, {
+    MSHADOW_IDX_TYPE_SWITCH(grad.aux_type(rowsparse::kIdx), IType, {
+      DType *weight_data = weight.dptr<DType>();
+      const IType *grad_idx = grad.aux_data(rowsparse::kIdx).dptr<IType>();
+      const DType *grad_val = grad.data().dptr<DType>();
+      DType *state_data = state.dptr<DType>();
+      DType *out_data = out->dptr<DType>();
+      const nnvm::dim_t num_rows = grad.aux_shape(rowsparse::kIdx)[0];
+      const auto row_length = weight.shape_.ProdShape(1, weight.ndim());
+      size_t num_threads = num_rows;
+
+      if (grad.storage_initialized()) {
+        if (std::is_same<xpu, gpu>::value) {
+          num_threads = num_rows * row_length;
+        }
+        Kernel<AdagradDnsRspDnsKernel<xpu>, xpu>::Launch(
+            s, num_threads, row_length, out_data, state_data, weight_data,
+            grad_idx, grad_val, static_cast<DType>(param.clip_gradient),
+            static_cast<DType>(param.float_stable_epsilon),
+            static_cast<DType>(param.lr),
+            static_cast<DType>(param.rescale_grad));
+      }
+      if (param.l2_regularization_strength > 0.0f) {
+        // When performing eager update, iterate over all rows of the weight
+        // array
+        if (!param.lazy_update) {
+          num_threads = weight.shape_[0];
+        } else if (grad.storage_initialized()) {
+          num_threads = num_rows;
+        } else { // Lazy update with 0 gradient
+          return;
+        }
+
+        DType *last_update_data = last_update_buffer.dptr<DType>();
+        Kernel<ProximalAdagradDnsRspKernel<xpu>, xpu>::Launch(
+            s, num_threads, row_length, out_data, state_data, grad_idx,
+            last_update_data, static_cast<DType>(param.current_update),
+            static_cast<DType>(param.l2_regularization_strength),
+            static_cast<DType>(param.lr),
+            static_cast<DType>(param.float_stable_epsilon),
+            static_cast<DType>(param.bisection_epsilon), param.lazy_update);
+      }
+    });
+  });
+}
+
+/*
+ * \brief Proximal adagrad update implementation for row_sparse grad.
+ *        Both standard update and lazy update are supported.
+ */
+template <typename xpu>
+inline void ProximalAdagradUpdateRspImpl(
+    const ProximalAdagradParam &param, const OpContext &ctx,
+    const NDArray &weight, const NDArray &grad, const NDArray &state,
+    const NDArray &last_update_buffer, const OpReqType &req, NDArray *out) {
+  CheckAllRowsPresent(weight, "ProximalAdagradUpdate", "weights");
+  CheckAllRowsPresent(state, "ProximalAdagradUpdate", "states");
+  // reuse dns rsp implementation when storage_shape == shape
+  TBlob out_blob = out->data();
+  ProximalAdagradUpdateDnsRspImpl<xpu>(param, ctx, weight.data(), grad,
+                                       state.data(), last_update_buffer.data(),
+                                       req, &out_blob);
+}
+
+template <typename xpu>
+inline void ProximalAdagradUpdate(const nnvm::NodeAttrs &attrs,
+                                  const OpContext &ctx,
+                                  const std::vector<TBlob> &inputs,
+                                  const std::vector<OpReqType> &req,
+                                  const std::vector<TBlob> &outputs) {
+  CHECK_EQ(0, 1) << "unimplemented";
+}
+
+template <typename xpu>
+inline void ProximalAdagradUpdateEx(const nnvm::NodeAttrs &attrs,
+                                    const OpContext &ctx,
+                                    const std::vector<NDArray> &inputs,
+                                    const std::vector<OpReqType> &req,
+                                    const std::vector<NDArray> &outputs) {
+  const ProximalAdagradParam &param =
+      nnvm::get<ProximalAdagradParam>(attrs.parsed);
+  const auto w_stype = inputs[0].storage_type();
+  const auto g_stype = inputs[1].storage_type();
+  const auto s_stype = inputs[2].storage_type();
+  const auto c_stype = inputs[3].storage_type();
+  const auto o_stype = outputs[0].storage_type();
+
+  if (o_stype == w_stype && g_stype == kRowSparseStorage &&
+      c_stype == kDefaultStorage &&
+      (s_stype == kDefaultStorage || s_stype == kRowSparseStorage) &&
+      (w_stype == kDefaultStorage || w_stype == kRowSparseStorage)) {
+    NDArray out = outputs[0];
+    // std update and lazy update with rsp grad
+    ProximalAdagradUpdateRspImpl<xpu>(param, ctx, inputs[0], inputs[1],
+                                      inputs[2], inputs[3], req[0], &out);
+  } else {
+    LogUnimplementedOp(attrs, ctx, inputs, req, outputs);
+  }
+}
+
 }  // namespace op
 }  // namespace mxnet
 
