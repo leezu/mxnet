@@ -314,7 +314,7 @@ inline bool ProximalSGDStorageType(const nnvm::NodeAttrs& attrs,
   CHECK_EQ(out_attrs->size(), 1U);
   const int weight_stype = in_attrs->at(0);
   const int grad_stype = in_attrs->at(1);
-  CHECK_EQ(in_attrs->at(2), kDefaultStorage);
+  CHECK_EQ(in_attrs->at(2), kDefaultStorage);  // last update counter
   bool dispatched = false;
   if (!dispatched && ContainsOnlyStorage(*in_attrs, kDefaultStorage)) {
     // dns, ... -> dns
