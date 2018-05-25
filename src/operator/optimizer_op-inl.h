@@ -804,16 +804,15 @@ struct ProximalSGDParam : public dmlc::Parameter<ProximalSGDParam> {
 
 /*! \brief kernel for enforcing group sparsity after sparse sgd update
  */
-template <int req, typename xpu> struct ProximalSGDDnsRspKernel {
+template <typename xpu> struct ProximalSGDDnsRspKernel {
   // DType is the output data type
   // IType is row sparse idx type
   // i is the ith row in row sparse gradient
   template <typename DType, typename IType>
   MSHADOW_XINLINE static void
-  Map(int i, const index_t row_length, DType *out, const DType *weight,
-      const IType *grad_idx, DType *last_update_buffer,
-      const DType current_update, const DType sparsity, const DType lr,
-      const bool lazy_update) {
+  Map(int i, const index_t row_length, DType *out, const IType *grad_idx,
+      DType *last_update_buffer, const DType current_update,
+      const DType sparsity, const DType lr, const bool lazy_update) {
 
     auto get_data_i = [&lazy_update, &i, &grad_idx,
                        &row_length](index_t j) -> index_t {
@@ -829,7 +828,7 @@ template <int req, typename xpu> struct ProximalSGDDnsRspKernel {
     mshadow::red::sum::SetInitValue(sum, residual);
     for (index_t j = 0; j < row_length; j++) {
       index_t data_i = get_data_i(j);
-      const DType val = weight[data_i] * weight[data_i];
+      const DType val = out[data_i] * out[data_i];
       mshadow::red::sum::Reduce(sum, val, residual);
     }
     DType norm = std::sqrt(sum);
@@ -853,13 +852,16 @@ template <int req, typename xpu> struct ProximalSGDDnsRspKernel {
     if (scaled_sparsity >= norm) {
       for (index_t j = 0; j < row_length; j++) {
         index_t data_i = get_data_i(j);
-        KERNEL_ASSIGN(out[data_i], req, 0);
+        // No need to use KERNEL_ASSIGN, as we already checked req is
+        // kWriteInplace
+        out[data_i] = 0;
       }
     } else {
       for (index_t j = 0; j < row_length; j++) {
         index_t data_i = get_data_i(j);
-        KERNEL_ASSIGN(out[data_i], req,
-                      weight[data_i] - scaled_sparsity * weight[data_i] / norm);
+        // No need to use KERNEL_ASSIGN, as we already checked req is
+        // kWriteInplace
+        out[data_i] = out[data_i] - (scaled_sparsity * out[data_i] / norm);
       }
     }
   }
@@ -881,58 +883,51 @@ ProximalSGDUpdateDnsRspImpl(const ProximalSGDParam &param, const OpContext &ctx,
   using namespace mxnet_op;
   Stream<xpu> *s = ctx.get_stream<xpu>();
   CHECK_EQ(grad.storage_type(), kRowSparseStorage);
-  CHECK_EQ(grad.storage_type(), kRowSparseStorage);
   // if gradients are zeros, no weights are updated
   if (req == kNullOp)
     return;
   CHECK_EQ(req, kWriteInplace)
-      << "kWriteInplace is expected for sparse sgd_mom_update";
+      << "kWriteInplace is expected for sparse proximal_sgd_update";
   CHECK_GT(weight.shape_.Size(), 0);
 
   MSHADOW_REAL_TYPE_SWITCH(weight.type_flag_, DType, {
     MSHADOW_IDX_TYPE_SWITCH(grad.aux_type(rowsparse::kIdx), IType, {
-      MXNET_ASSIGN_REQ_SWITCH(req, req_type, {
-        DType *weight_data = weight.dptr<DType>();
-        const auto row_length = weight.shape_.ProdShape(1, weight.ndim());
-        const IType *grad_idx = grad.aux_data(rowsparse::kIdx).dptr<IType>();
-        const DType *grad_val = grad.data().dptr<DType>();
-        const nnvm::dim_t num_rows = grad.aux_shape(rowsparse::kIdx)[0];
-        size_t num_threads = num_rows;
+      DType *weight_data = weight.dptr<DType>();
+      DType *out_data = out->dptr<DType>();
+      const auto row_length = weight.shape_.ProdShape(1, weight.ndim());
+      const IType *grad_idx = grad.aux_data(rowsparse::kIdx).dptr<IType>();
+      const DType *grad_val = grad.data().dptr<DType>();
+      const nnvm::dim_t num_rows = grad.aux_shape(rowsparse::kIdx)[0];
+      size_t num_threads = num_rows;
 
-        if (grad.storage_initialized()) {
-          if (std::is_same<xpu, gpu>::value) {
-            num_threads = num_rows * row_length;
-          }
-          Kernel<SGDDnsRspKernel<req_type, xpu>, xpu>::Launch(
-              s, num_threads, row_length, out->dptr<DType>(), weight_data,
-              grad_idx, grad_val, static_cast<DType>(param.clip_gradient),
-              static_cast<DType>(param.lr), static_cast<DType>(0.0f),
-              static_cast<DType>(param.rescale_grad));
+      if (grad.storage_initialized()) {
+        if (std::is_same<xpu, gpu>::value) {
+          num_threads = num_rows * row_length;
         }
-        if (param.sparsity > 0.0f) {
-          // When performing eager update, iterate over all rows of the weight
-          // array
-          if (!param.lazy_update) {
-            num_threads = weight.shape_[0];
-          } else if (grad.storage_initialized()) {
-            num_threads = num_rows;
-          } else { // Lazy update with 0 gradient
-            return;
-          }
-
-          // TODO infer the current iteration instead of taking it as param
-          // The iteration of the current update is the max of
-          // last_update_buffer + 1 DType current_update; mshadow::red::maximum
-
-          DType *last_update_data = last_update_buffer.dptr<DType>();
-          Kernel<ProximalSGDDnsRspKernel<req_type, xpu>, xpu>::Launch(
-              s, num_threads, row_length, out->dptr<DType>(), weight_data,
-              grad_idx, last_update_data,
-              static_cast<DType>(param.current_update),
-              static_cast<DType>(param.sparsity), static_cast<DType>(param.lr),
-              param.lazy_update);
+        Kernel<SGDDnsRspKernel<kWriteInplace, xpu>, xpu>::Launch(
+            s, num_threads, row_length, out_data, weight_data, grad_idx,
+            grad_val, static_cast<DType>(param.clip_gradient),
+            static_cast<DType>(param.lr), static_cast<DType>(0.0f),
+            static_cast<DType>(param.rescale_grad));
+      }
+      if (param.sparsity > 0.0f) {
+        // When performing eager update, iterate over all rows of the weight
+        // array
+        if (!param.lazy_update) {
+          num_threads = weight.shape_[0];
+        } else if (grad.storage_initialized()) {
+          num_threads = num_rows;
+        } else { // Lazy update with 0 gradient
+          return;
         }
-      });
+
+        DType *last_update_data = last_update_buffer.dptr<DType>();
+        Kernel<ProximalSGDDnsRspKernel<xpu>, xpu>::Launch(
+            s, num_threads, row_length, out_data, grad_idx, last_update_data,
+            static_cast<DType>(param.current_update),
+            static_cast<DType>(param.sparsity), static_cast<DType>(param.lr),
+            param.lazy_update);
+      }
     });
   });
 }
@@ -983,8 +978,6 @@ inline void ProximalSGDUpdateEx(const nnvm::NodeAttrs &attrs,
     LogUnimplementedOp(attrs, ctx, inputs, req, outputs);
   }
 }
-
-// TODO LEEZU
 
 
 struct FTMLParam : public dmlc::Parameter<FTMLParam> {
