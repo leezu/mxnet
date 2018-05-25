@@ -40,6 +40,7 @@ DMLC_REGISTER_PARAMETER(FtrlParam);
 DMLC_REGISTER_PARAMETER(SignSGDParam);
 DMLC_REGISTER_PARAMETER(SignumParam);
 DMLC_REGISTER_PARAMETER(AdagradParam);
+DMLC_REGISTER_PARAMETER(ProximalAdagradParam);
 
 NNVM_REGISTER_OP(signsgd_update)
 .describe(R"code(Update function for SignSGD optimizer.
@@ -754,6 +755,55 @@ Note that non-zero values for the weight decay option are not supported.
 .add_argument("grad", "NDArray-or-Symbol", "Gradient")
 .add_argument("history", "NDArray-or-Symbol", "History")
 .add_arguments(AdagradParam::__FIELDS__());
+
+
+/*!
+ * \brief Shape inference function for Proximal SGD.
+ */
+inline bool ProximalAdagradShape(const nnvm::NodeAttrs &attrs,
+                                 std::vector<TShape> *in_attrs,
+                                 std::vector<TShape> *out_attrs) {
+  CHECK_EQ(in_attrs->size(), 4U);
+  CHECK_EQ(out_attrs->size(), 1U);
+
+  SHAPE_ASSIGN_CHECK(*out_attrs, 0, in_attrs->at(0));
+  SHAPE_ASSIGN_CHECK(*out_attrs, 0, in_attrs->at(1));
+  SHAPE_ASSIGN_CHECK(*in_attrs, 0, out_attrs->at(0));
+  SHAPE_ASSIGN_CHECK(*in_attrs, 1, out_attrs->at(0));
+
+  // TODO(leezu): This doesn't do reverse shape inference for aux input
+
+  return out_attrs->at(0).ndim() != 0U && out_attrs->at(0).Size() != 0U &&
+         (in_attrs->at(0)[0] == in_attrs->at(1)[0]) &&
+         (in_attrs->at(0)[0] == in_attrs->at(2)[0]);
+}
+
+NNVM_REGISTER_OP(proximal_adagrad_update)
+MXNET_ADD_SPARSE_OP_ALIAS(proximal_adagrad_update)
+.describe(R"code(Update function for Proximal AdaGrad optimizer.
+
+Referenced from *Adaptive Subgradient Methods for Online Learning and Stochastic Optimization*,
+and available at http://www.jmlr.org/papers/volume12/duchi11a/duchi11a.pdf.
+
+TODO(leezu): Document
+
+)code" ADD_FILELINE)
+.set_num_inputs(4)
+.set_num_outputs(1)
+.set_attr_parser(ParamParser<ProximalAdagradParam>)
+.set_attr<nnvm::FInferShape>("FInferShape", ProximalAdagradShape)
+.set_attr<nnvm::FInferType>("FInferType", ElemwiseType<4, 1>)
+.set_attr<FInferStorageType>("FInferStorageType", ProximalAdagradStorageType)
+.set_attr<nnvm::FMutateInputs>("FMutateInputs",
+  [](const nnvm::NodeAttrs& attrs) {
+    return std::vector<uint32_t>{2};
+  })
+.set_attr<FComputeEx>("FComputeEx<cpu>", AdagradUpdateEx<cpu>)
+.add_argument("weight", "NDArray-or-Symbol", "Weight")
+.add_argument("grad", "NDArray-or-Symbol", "Gradient")
+.add_argument("history", "NDArray-or-Symbol", "History")
+.add_argument("last_update_buffer", "NDArray-or-Symbol", "Last update buffer")
+.add_arguments(ProximalAdagradParam::__FIELDS__());
 
 }  // namespace op
 }  // namespace mxnet
