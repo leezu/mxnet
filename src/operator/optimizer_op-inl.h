@@ -711,7 +711,8 @@ struct ProximalSGDParam : public dmlc::Parameter<ProximalSGDParam> {
   float lr;
   float rescale_grad;
   float clip_gradient;
-  float sparsity;
+  float clip_group_gradient_norm;
+  float l2_regularization_strength;
   float current_update;
   bool lazy_update;
   DMLC_DECLARE_PARAMETER(ProximalSGDParam) {
@@ -725,8 +726,15 @@ struct ProximalSGDParam : public dmlc::Parameter<ProximalSGDParam> {
             "Clip gradient to the range of [-clip_gradient, clip_gradient] "
             "If clip_gradient <= 0, gradient clipping is turned off. "
             "grad = max(min(grad, clip_gradient), -clip_gradient).");
-    DMLC_DECLARE_FIELD(sparsity).set_default(0.0f).describe(
-        "Lambda term for group lasso objective.");
+    DMLC_DECLARE_FIELD(clip_group_gradient_norm)
+        .set_default(-1.0f)
+        .describe(
+            "Rescale gradient group-wise so that the L2 norm of each group "
+            "is smaller than clip_group_gradient_norm."
+            "If clip_group_gradient_norm <= 0, rescaling is turned off. ");
+    DMLC_DECLARE_FIELD(l2_regularization_strength)
+        .set_default(0.0f)
+        .describe("Lambda term for group lasso objective.");
     DMLC_DECLARE_FIELD(current_update)
         .set_default(0.0f)
         .describe("Current update iteration for lazy update with group lasso "
@@ -746,58 +754,185 @@ template <typename xpu> struct ProximalSGDDnsRspKernel {
   // i is the ith row in row sparse gradient
   template <typename DType, typename IType>
   MSHADOW_XINLINE static void
-  Map(int i, const index_t row_length, DType *out, const IType *grad_idx,
-      DType *last_update_buffer, const DType current_update,
-      const DType sparsity, const DType lr, const bool lazy_update) {
+  Map(int i, const index_t row_length, DType *out, const DType *weight,
+      const IType *grad_idx, const DType *grad_val, DType *last_update_buffer,
+      const DType current_update, const DType clip_gradient,
+      const DType clip_group_gradient_norm, const DType lr,
+      const DType rescale_grad, const DType l2_regularization_strength) {
 
-    auto get_data_i = [&lazy_update, &i, &grad_idx,
-                       &row_length](index_t j) -> index_t {
-      if (lazy_update) {
-        return grad_idx[i] * row_length + j;
+    DType group_rescale = 1;
+    // Check if gradient needs to be rescaled
+    if (clip_group_gradient_norm >= 0.0f) {
+      DType sum, residual;
+      mshadow::red::sum::SetInitValue(sum, residual);
+      if (clip_gradient >= 0.0f) {
+        for (index_t j = 0; j < row_length; j++) {
+          index_t grad_i = i * row_length + j;
+          DType grad_ = mshadow_op::clip::Map(rescale_grad * grad_val[grad_i],
+                                              clip_gradient);
+          mshadow::red::sum::Reduce(sum, grad_ * grad_, residual);
+        }
       } else {
-        return i * row_length + j;
+        for (index_t j = 0; j < row_length; j++) {
+          index_t grad_i = i * row_length + j;
+          DType grad_ = rescale_grad * grad_val[grad_i];
+          mshadow::red::sum::Reduce(sum, grad_ * grad_, residual);
+        }
       }
-    };
+      DType grad_norm = std::sqrt(sum);
+      if (grad_norm > clip_group_gradient_norm) {
+        group_rescale =  clip_group_gradient_norm / grad_norm;
+      }
+    }
 
-    // Compute the L2 norm of this row
-    DType sum, residual; // TODO Kahan summation may not be necessary
+    // Apply gradient
+    for (index_t j = 0; j < row_length; j++) {
+      index_t data_i = grad_idx[i] * row_length + j;
+      index_t grad_i = i * row_length + j;
+      // No need to use KERNEL_ASSIGN, as we already checked req is
+      // kWriteInplace
+      out[data_i] = weight[data_i] -
+        lr * group_rescale * rescale_grad * grad_val[grad_i];
+    }
+
+    // Apply proximal operator
+    DType sum, residual;
     mshadow::red::sum::SetInitValue(sum, residual);
     for (index_t j = 0; j < row_length; j++) {
-      index_t data_i = get_data_i(j);
-      const DType val = out[data_i] * out[data_i];
-      mshadow::red::sum::Reduce(sum, val, residual);
+      index_t data_i = grad_idx[i] * row_length + j;
+      mshadow::red::sum::Reduce(sum, out[data_i] * out[data_i], residual);
     }
-    DType norm = std::sqrt(sum);
+    DType weight_norm = std::sqrt(sum);
 
     // Compute number of weight updates skipped due to lazy_update
-    DType num_skipped;
-    if (lazy_update) {
-      num_skipped = current_update - last_update_buffer[grad_idx[i]];
-      last_update_buffer[grad_idx[i]] = current_update;
-    } else {
-      num_skipped = current_update - last_update_buffer[i];
-      last_update_buffer[i] = current_update;
-    }
-    // Workaround erroneous last_update_buffer
+    DType num_skipped = current_update - last_update_buffer[grad_idx[i]];
+    last_update_buffer[grad_idx[i]] = current_update;
+
+    // In case of erroneous last_update_buffer
     if (num_skipped < 1) {
+      std::printf("Got invalid last_update_buffer in proximal_sgd_update. "
+                  "Ignoring.");
       num_skipped = 1;
     }
-    DType scaled_sparsity = sparsity * num_skipped * lr;
+    DType scaled_l2_regularization_strength =
+        l2_regularization_strength * num_skipped * lr * group_rescale;
 
     // Soft threshold weights (proximal map for group lasso)
-    if (scaled_sparsity >= norm) {
+    if (scaled_l2_regularization_strength >= weight_norm) {
       for (index_t j = 0; j < row_length; j++) {
-        index_t data_i = get_data_i(j);
         // No need to use KERNEL_ASSIGN, as we already checked req is
         // kWriteInplace
+        index_t data_i = grad_idx[i] * row_length + j;
         out[data_i] = 0;
       }
     } else {
       for (index_t j = 0; j < row_length; j++) {
-        index_t data_i = get_data_i(j);
         // No need to use KERNEL_ASSIGN, as we already checked req is
         // kWriteInplace
-        out[data_i] = out[data_i] - (scaled_sparsity * out[data_i] / norm);
+        index_t data_i = grad_idx[i] * row_length + j;
+        out[data_i] = out[data_i] - (scaled_l2_regularization_strength *
+                                     out[data_i] / weight_norm);
+      }
+    }
+  }
+};
+
+template <typename xpu> struct EagerProximalSGDDnsRspKernel {
+  // DType is the output data type
+  // IType is row sparse idx type
+  // i is the ith row in row sparse gradient
+  template <typename DType, typename IType>
+  MSHADOW_XINLINE static void
+  Map(int i, const index_t row_length, const index_t num_grad, DType *out,
+      const DType *weight, const IType *grad_idx, const DType *grad_val,
+      DType *last_update_buffer, const DType current_update,
+      const DType clip_gradient, const DType clip_group_gradient_norm,
+      const DType lr, const DType rescale_grad,
+      const DType l2_regularization_strength) {
+    // Check if there is a gradient for this group
+    // TODO use binary search
+    index_t i_grad_idx = num_grad;
+    for (index_t j = 0; j < num_grad; j++) {
+      if (grad_idx[j] == i) {
+        i_grad_idx = j;
+        break;
+      }
+    }
+
+    DType group_rescale = 1;
+    if (i_grad_idx != num_grad) {
+      // Check if gradient needs to be rescaled
+      if (clip_group_gradient_norm >= 0.0f) {
+        DType sum, residual;
+        mshadow::red::sum::SetInitValue(sum, residual);
+        if (clip_gradient >= 0.0f) {
+          for (index_t j = 0; j < row_length; j++) {
+            index_t grad_i = i_grad_idx * row_length + j;
+            DType grad_ = mshadow_op::clip::Map(rescale_grad * grad_val[grad_i],
+                                                clip_gradient);
+            mshadow::red::sum::Reduce(sum, grad_ * grad_, residual);
+          }
+        } else {
+          for (index_t j = 0; j < row_length; j++) {
+            index_t grad_i = i_grad_idx * row_length + j;
+            DType grad_ = rescale_grad * grad_val[grad_i];
+            mshadow::red::sum::Reduce(sum, grad_ * grad_, residual);
+          }
+        }
+        DType grad_norm = std::sqrt(sum);
+        if (grad_norm > clip_group_gradient_norm) {
+          group_rescale = clip_group_gradient_norm / grad_norm;
+        }
+      }
+
+      // Apply gradient
+      for (index_t j = 0; j < row_length; j++) {
+        index_t data_i = i * row_length + j;
+        index_t grad_i = i_grad_idx * row_length + j;
+        // No need to use KERNEL_ASSIGN, as we already checked req is
+        // kWriteInplace
+        out[data_i] = weight[data_i] -
+                      lr * group_rescale * rescale_grad * grad_val[grad_i];
+      }
+    }
+
+    // Apply proximal operator
+    DType sum, residual;
+    mshadow::red::sum::SetInitValue(sum, residual);
+    for (index_t j = 0; j < row_length; j++) {
+      index_t data_i = i * row_length + j;
+      mshadow::red::sum::Reduce(sum, out[data_i] * out[data_i], residual);
+    }
+    DType weight_norm = std::sqrt(sum);
+
+    // Compute number of weight updates skipped due to lazy_update
+    DType num_skipped = current_update - last_update_buffer[i];
+    last_update_buffer[i] = current_update;
+
+    // In case of erroneous last_update_buffer
+    if (num_skipped < 1) {
+      std::printf("Got invalid last_update_buffer in proximal_sgd_update. "
+                  "Ignoring.");
+      num_skipped = 1;
+    }
+    DType scaled_l2_regularization_strength =
+        l2_regularization_strength * num_skipped * lr * group_rescale;
+
+    // Soft threshold weights (proximal map for group lasso)
+    if (scaled_l2_regularization_strength >= weight_norm) {
+      for (index_t j = 0; j < row_length; j++) {
+        // No need to use KERNEL_ASSIGN, as we already checked req is
+        // kWriteInplace
+        index_t data_i = i * row_length + j;
+        out[data_i] = 0;
+      }
+    } else {
+      for (index_t j = 0; j < row_length; j++) {
+        // No need to use KERNEL_ASSIGN, as we already checked req is
+        // kWriteInplace
+        index_t data_i = i * row_length + j;
+        out[data_i] = out[data_i] - (scaled_l2_regularization_strength *
+                                     out[data_i] / weight_norm);
       }
     }
   }
@@ -830,39 +965,37 @@ ProximalSGDUpdateDnsRspImpl(const ProximalSGDParam &param, const OpContext &ctx,
     MSHADOW_IDX_TYPE_SWITCH(grad.aux_type(rowsparse::kIdx), IType, {
       DType *weight_data = weight.dptr<DType>();
       DType *out_data = out->dptr<DType>();
-      const auto row_length = weight.shape_.ProdShape(1, weight.ndim());
       const IType *grad_idx = grad.aux_data(rowsparse::kIdx).dptr<IType>();
       const DType *grad_val = grad.data().dptr<DType>();
-      const nnvm::dim_t num_rows = grad.aux_shape(rowsparse::kIdx)[0];
-      size_t num_threads = num_rows;
+      DType *last_update_data = last_update_buffer.dptr<DType>();
+      const nnvm::dim_t num_grad = grad.aux_shape(rowsparse::kIdx)[0];
+      const auto row_length = weight.shape_.ProdShape(1, weight.ndim());
 
-      if (grad.storage_initialized()) {
-        if (std::is_same<xpu, gpu>::value) {
-          num_threads = num_rows * row_length;
-        }
-        Kernel<SGDDnsRspKernel<kWriteInplace, xpu>, xpu>::Launch(
-            s, num_threads, row_length, out_data, weight_data, grad_idx,
-            grad_val, static_cast<DType>(param.clip_gradient),
-            static_cast<DType>(param.lr), static_cast<DType>(0.0f),
-            static_cast<DType>(param.rescale_grad));
-      }
-      if (param.sparsity > 0.0f) {
-        // When performing eager update, iterate over all rows of the weight
-        // array
-        if (!param.lazy_update) {
-          num_threads = weight.shape_[0];
-        } else if (grad.storage_initialized()) {
-          num_threads = num_rows;
-        } else { // Lazy update with 0 gradient
-          return;
-        }
-
-        DType *last_update_data = last_update_buffer.dptr<DType>();
-        Kernel<ProximalSGDDnsRspKernel<xpu>, xpu>::Launch(
-            s, num_threads, row_length, out_data, grad_idx, last_update_data,
+      // When performing eager update, iterate over all rows
+      if (!param.lazy_update) {
+        size_t num_threads = weight.shape_[0];
+        Kernel<EagerProximalSGDDnsRspKernel<xpu>, xpu>::Launch(
+            s, num_threads, row_length, num_grad, out_data, weight_data,
+            grad_idx, grad_val, last_update_data,
             static_cast<DType>(param.current_update),
-            static_cast<DType>(param.sparsity), static_cast<DType>(param.lr),
-            param.lazy_update);
+            static_cast<DType>(param.clip_gradient),
+            static_cast<DType>(param.clip_group_gradient_norm),
+            static_cast<DType>(param.lr),
+            static_cast<DType>(param.rescale_grad),
+            static_cast<DType>(param.l2_regularization_strength));
+      } else if (grad.storage_initialized()) {
+        size_t num_threads = num_grad;
+        Kernel<ProximalSGDDnsRspKernel<xpu>, xpu>::Launch(
+            s, num_threads, row_length, out_data, weight_data, grad_idx,
+            grad_val, last_update_data,
+            static_cast<DType>(param.current_update),
+            static_cast<DType>(param.clip_gradient),
+            static_cast<DType>(param.clip_group_gradient_norm),
+            static_cast<DType>(param.lr),
+            static_cast<DType>(param.rescale_grad),
+            static_cast<DType>(param.l2_regularization_strength));
+      } else { // Lazy update with 0 gradient
+        return;
       }
     });
   });
