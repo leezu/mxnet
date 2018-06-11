@@ -24,7 +24,7 @@ import pickle
 import warnings
 import numpy
 from .base import py_str
-from .ndarray import (NDArray, zeros, clip, sqrt, cast, maximum, abs as NDabs)
+from .ndarray import (NDArray, zeros, full, clip, sqrt, cast, maximum, abs as NDabs)
 from .ndarray import (sgd_update, sgd_mom_update, adam_update, rmsprop_update, rmspropalex_update,
                       mp_sgd_update, mp_sgd_mom_update, square, ftrl_update, ftml_update,
                       signsgd_update, signum_update)
@@ -1093,12 +1093,15 @@ class AdaGrad(Optimizer):
         Small value to avoid division by 0.
 
     """
-    def __init__(self, eps=1e-7, **kwargs):
+    def __init__(self, eps=1e-7, state_init_value=0, **kwargs):
         super(AdaGrad, self).__init__(**kwargs)
         self.float_stable_eps = eps
+        self.state_init_value = state_init_value
 
     def create_state(self, index, weight):
-        return zeros(weight.shape, weight.context, stype=weight.stype)  # history
+        # history
+        return full(weight.shape, self.state_init_value,
+                    weight.context, stype=weight.stype)
 
     def update(self, index, weight, grad, state):
         assert(isinstance(weight, NDArray))
