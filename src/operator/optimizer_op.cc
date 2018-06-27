@@ -798,7 +798,7 @@ TODO(leezu): Document
   [](const nnvm::NodeAttrs& attrs) {
     return std::vector<uint32_t>{2};
   })
-.set_attr<FComputeEx>("FComputeEx<cpu>", AdagradUpdateEx<cpu>)
+.set_attr<FComputeEx>("FComputeEx<cpu>", ProximalAdagradUpdateEx<cpu>)
 .add_argument("weight", "NDArray-or-Symbol", "Weight")
 .add_argument("grad", "NDArray-or-Symbol", "Gradient")
 .add_argument("history", "NDArray-or-Symbol", "History")
