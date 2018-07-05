@@ -2363,7 +2363,7 @@ template <typename xpu> struct ProximalAdagradDnsRspKernel {
             nu_ssq = 1 + nu_ssq * (nu_scale / absxi) * (nu_scale / absxi);
             nu_scale = absxi;
           } else {
-            nu_ssq = nu_ssq + (absxi / nu_scale) * (nu_scale / absxi);
+            nu_ssq = nu_ssq + (absxi / nu_scale) * (absxi / nu_scale);
           }
         }
       }
@@ -2409,7 +2409,7 @@ template <typename xpu> struct ProximalAdagradDnsRspKernel {
             alpha_scale = absxi;
           } else {
             alpha_ssq =
-                alpha_ssq + (absxi / alpha_scale) * (alpha_scale / absxi);
+                alpha_ssq + (absxi / alpha_scale) * (absxi / alpha_scale);
           }
         }
         DType alpha_norm = alpha_scale * std::sqrt(alpha_ssq);
