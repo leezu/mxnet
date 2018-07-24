@@ -2329,16 +2329,25 @@ template <typename xpu> struct ProximalAdagradDnsRspKernel {
       num_skipped = current_update - last_update_data[i];
       last_update_data[i] = current_update;
     }
-    // Workaround erroneous last_update_buffer
-    if (num_skipped < 1) {
+    // Warn in case of erroneous last_update_buffer
+    if (num_skipped < 0) {
       std::printf("Got invalid last_update in proximal_adagrad_update. "
-                  "Ignoring.\n");
-      num_skipped = 1;
+                  "Using standard Adagrad update.\n");
     }
     DType scaled_sparsity = l2_regularization_strength * num_skipped * lr;
 
-    // Soft threshold weights (proximal map for group lasso)
-    if (u_norm <= scaled_sparsity) {
+    if (scaled_sparsity <= 0) {
+      // Standard Adagrad Update
+      for (index_t j = 0; j < row_length; j++) {
+        // clang-format off
+        const DType grad_rescaled = get_grad_rescaled(j);
+        index_t data_j = get_data_j(j);
+        const DType div = lr * grad_rescaled / square_root::Map(state_data[data_j] + float_stable_epsilon);
+        out_data[data_j] = weight_data[data_j] - div;
+        // clang-format on
+      }
+    } else if (u_norm <= scaled_sparsity) {
+      // Soft threshold weights (proximal map for group lasso)
       for (index_t j = 0; j < row_length; j++) {
         index_t data_j = get_data_j(j);
         out_data[data_j] = 0;
