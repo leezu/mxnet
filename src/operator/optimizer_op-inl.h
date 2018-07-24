@@ -2300,25 +2300,18 @@ template <typename xpu> struct ProximalAdagradDnsRspKernel {
     }
 
     // Compute ||u||₂ using scaled sum of squares
-    DType u_scale = 0;
-    DType u_ssq = 0;
+    DType u_ssq, u_scale;
+    mshadow_op::nrm2::SetInitValue(u_ssq, u_scale);
     for (index_t j = 0; j < row_length; j++) {
       const DType grad_rescaled = get_grad_rescaled(j);
       index_t data_j = get_data_j(j);
       const DType val = (lr * grad_rescaled) -
                         (std::sqrt(state_data[data_j] + float_stable_epsilon) *
                          weight_data[data_j]);
-      if (val != 0) {
-        DType absxi = std::abs(val);
-        if (u_scale < absxi) {
-          u_ssq = 1 + u_ssq * (u_scale / absxi) * (u_scale / absxi);
-          u_scale = absxi;
-        } else {
-          u_ssq = u_ssq + (absxi / u_scale) * (absxi / u_scale);
-        }
-      }
+      mshadow_op::nrm2::Reduce(u_ssq, val, u_scale);
     }
-    DType u_norm = u_scale * std::sqrt(u_ssq);
+    mshadow_op::nrm2::Finalize(u_ssq, u_scale);
+    DType u_norm = u_ssq;
 
     // Compute number of weight updates skipped due to lazy_update
     DType num_skipped;
@@ -2355,8 +2348,8 @@ template <typename xpu> struct ProximalAdagradDnsRspKernel {
     } else {
       // Find θ with Algorithm 4 of Dutchi 2011 paper
       // Compute ||ν||₂ using scaled sum of squares
-      DType nu_scale = 0;
-      DType nu_ssq = 0;
+      DType nu_ssq, nu_scale;
+      mshadow_op::nrm2::SetInitValue(nu_ssq, nu_scale);
       for (index_t j = 0; j < row_length; j++) {
         // clang-format off
         const DType grad_rescaled = get_grad_rescaled(j);
@@ -2365,18 +2358,11 @@ template <typename xpu> struct ProximalAdagradDnsRspKernel {
                           std::sqrt(state_data[data_j] +
                                     float_stable_epsilon)) -
                           weight_data[data_j];
+        mshadow_op::nrm2::Reduce(nu_ssq, nu, nu_scale);
         // clang-format on
-        if (nu != 0) {
-          DType absxi = std::abs(nu);
-          if (nu_scale < absxi) {
-            nu_ssq = 1 + nu_ssq * (nu_scale / absxi) * (nu_scale / absxi);
-            nu_scale = absxi;
-          } else {
-            nu_ssq = nu_ssq + (absxi / nu_scale) * (absxi / nu_scale);
-          }
-        }
       }
-      DType nu_norm = nu_scale * std::sqrt(nu_ssq);
+      mshadow_op::nrm2::Finalize(nu_ssq, nu_scale);
+      DType nu_norm = nu_ssq;
 
       DType sigma_min, sigma_max;
       mshadow::red::minimum::SetInitValue(sigma_min);
@@ -2401,8 +2387,8 @@ template <typename xpu> struct ProximalAdagradDnsRspKernel {
         theta = theta_max / 2.0 + theta_min / 2.0;
 
         // Compute ||α(θ)||₂
-        DType alpha_scale = 0;
-        DType alpha_ssq = 0;
+        DType alpha_ssq, alpha_scale;
+        mshadow_op::nrm2::SetInitValue(alpha_ssq, alpha_scale);
         for (index_t j = 0; j < row_length; j++) {
           // clang-format off
           const DType grad_rescaled = get_grad_rescaled(j);
@@ -2410,18 +2396,11 @@ template <typename xpu> struct ProximalAdagradDnsRspKernel {
           const DType alpha = -(1 / ((1 / square_root::Map(state_data[data_j] + float_stable_epsilon)) + theta)) *
                                ((lr * grad_rescaled / square_root::Map(state_data[data_j] + float_stable_epsilon)) -
                                   weight_data[data_j]);
+          mshadow_op::nrm2::Reduce(alpha_ssq, alpha, alpha_scale);
           // clang-format on
-          DType absxi = std::abs(alpha);
-          if (alpha_scale < absxi) {
-            alpha_ssq =
-                1 + alpha_ssq * (alpha_scale / absxi) * (alpha_scale / absxi);
-            alpha_scale = absxi;
-          } else {
-            alpha_ssq =
-                alpha_ssq + (absxi / alpha_scale) * (absxi / alpha_scale);
-          }
         }
-        DType alpha_norm = alpha_scale * std::sqrt(alpha_ssq);
+        mshadow_op::nrm2::Finalize(alpha_ssq, alpha_scale);
+        DType alpha_norm = alpha_ssq;
 
         if (alpha_norm > scaled_sparsity) {
           theta_min = theta;
