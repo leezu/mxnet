@@ -2179,6 +2179,8 @@ struct ProximalAdagradParam : public dmlc::Parameter<ProximalAdagradParam> {
   float l2_regularization_strength;
   float current_update;
   bool lazy_update;
+  bool decay_states;
+  float decay_factor;
   DMLC_DECLARE_PARAMETER(ProximalAdagradParam) {
     DMLC_DECLARE_FIELD(lr).describe("Learning rate");
     DMLC_DECLARE_FIELD(rescale_grad)
@@ -2207,6 +2209,12 @@ struct ProximalAdagradParam : public dmlc::Parameter<ProximalAdagradParam> {
         .set_default(true)
         .describe("If true, lazy updates are applied if gradient's stype is "
                   "row_sparse.");
+    DMLC_DECLARE_FIELD(decay_states)
+      .set_default(true)
+      .describe("Decay states as in RMSProp.");
+    DMLC_DECLARE_FIELD(decay_factor)
+      .set_default(0.9f)
+      .describe("Decay factor for states. New gradient is weighted with (1-decay_factor).");
   }
 };
 
@@ -2250,7 +2258,8 @@ template <typename xpu> struct ProximalAdagradDnsRspKernel {
       const DType current_update, const DType clip_gradient,
       const DType rescale_grad, const DType l2_regularization_strength,
       const DType lr, const DType float_stable_epsilon,
-      const DType bisection_epsilon, const bool lazy_update) {
+      const DType bisection_epsilon, const bool lazy_update,
+      const bool decay_states, const DType decay_factor) {
     using namespace mshadow_op;
 
     // Eager update: Find location in gradient index
@@ -2291,12 +2300,34 @@ template <typename xpu> struct ProximalAdagradDnsRspKernel {
       return grad_rescaled;
     };
 
+    // Compute number of weight updates skipped due to lazy_update
+    DType num_skipped;
+    if (lazy_update) {
+      num_skipped = current_update - last_update_data[grad_idx[i]];
+      last_update_data[grad_idx[i]] = current_update;
+    } else {
+      num_skipped = current_update - last_update_data[i];
+      last_update_data[i] = current_update;
+    }
+    // Warn in case of erroneous last_update_buffer
+    if (num_skipped < 0) {
+      num_skipped = 0;
+      std::printf("Got invalid last_update in proximal_adagrad_update. "
+                  "Using standard Adagrad update.\n");
+    }
+
     // Update history states
     for (index_t j = 0; j < row_length; j++) {
       const DType grad_rescaled = get_grad_rescaled(j);
       const DType grad_squared = grad_rescaled * grad_rescaled;
       index_t data_j = get_data_j(j);
-      state_data[data_j] += grad_squared;
+      if (!decay_states) {
+        state_data[data_j] += grad_squared;
+      } else {
+        state_data[data_j] =
+            state_data[data_j] * std::pow(decay_factor, num_skipped) +
+            grad_squared * (1 - decay_factor);
+      }
     }
 
     // Compute ||u||₂ using scaled sum of squares
@@ -2313,22 +2344,7 @@ template <typename xpu> struct ProximalAdagradDnsRspKernel {
     mshadow_op::nrm2::Finalize(u_ssq, u_scale);
     DType u_norm = u_ssq;
 
-    // Compute number of weight updates skipped due to lazy_update
-    DType num_skipped;
-    if (lazy_update) {
-      num_skipped = current_update - last_update_data[grad_idx[i]];
-      last_update_data[grad_idx[i]] = current_update;
-    } else {
-      num_skipped = current_update - last_update_data[i];
-      last_update_data[i] = current_update;
-    }
-    // Warn in case of erroneous last_update_buffer
-    if (num_skipped < 0) {
-      std::printf("Got invalid last_update in proximal_adagrad_update. "
-                  "Using standard Adagrad update.\n");
-    }
     DType scaled_sparsity = l2_regularization_strength * num_skipped * lr;
-
     if (scaled_sparsity <= 0) {
       // Standard Adagrad Update
       for (index_t j = 0; j < row_length; j++) {
@@ -2492,7 +2508,8 @@ inline void ProximalAdagradUpdateDnsRspDnsImpl(
           static_cast<DType>(param.l2_regularization_strength),
           static_cast<DType>(param.lr),
           static_cast<DType>(param.float_stable_epsilon),
-          static_cast<DType>(param.bisection_epsilon), param.lazy_update);
+          static_cast<DType>(param.bisection_epsilon), param.lazy_update,
+          param.decay_states, static_cast<DType>(param.decay_factor));
     });
   });
 }
