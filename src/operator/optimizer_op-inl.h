@@ -2181,6 +2181,7 @@ struct ProximalAdagradParam : public dmlc::Parameter<ProximalAdagradParam> {
   bool lazy_update;
   bool decay_states;
   float decay_factor;
+  bool lazy_decay;
   DMLC_DECLARE_PARAMETER(ProximalAdagradParam) {
     DMLC_DECLARE_FIELD(lr).describe("Learning rate");
     DMLC_DECLARE_FIELD(rescale_grad)
@@ -2215,6 +2216,9 @@ struct ProximalAdagradParam : public dmlc::Parameter<ProximalAdagradParam> {
     DMLC_DECLARE_FIELD(decay_factor)
       .set_default(0.9f)
       .describe("Decay factor for states. New gradient is weighted with (1-decay_factor).");
+    DMLC_DECLARE_FIELD(lazy_decay)
+      .set_default(true)
+      .describe("If true, decay is applied lazily.");
   }
 };
 
@@ -2259,7 +2263,7 @@ template <typename xpu> struct ProximalAdagradDnsRspKernel {
       const DType rescale_grad, const DType l2_regularization_strength,
       const DType lr, const DType float_stable_epsilon,
       const DType bisection_epsilon, const bool lazy_update,
-      const bool decay_states, const DType decay_factor) {
+      const bool decay_states, const DType decay_factor, const bool lazy_decay) {
     using namespace mshadow_op;
 
     // Eager update: Find location in gradient index
@@ -2324,9 +2328,14 @@ template <typename xpu> struct ProximalAdagradDnsRspKernel {
       if (!decay_states) {
         state_data[data_j] += grad_squared;
       } else {
-        state_data[data_j] =
-            state_data[data_j] * std::pow(decay_factor, num_skipped) +
-            grad_squared * (1 - decay_factor);
+        if (!lazy_decay) {
+          state_data[data_j] =
+              state_data[data_j] * std::pow(decay_factor, num_skipped) +
+              grad_squared * (1 - decay_factor);
+        } else {
+          state_data[data_j] = state_data[data_j] * decay_factor +
+                               grad_squared * (1 - decay_factor);
+        }
       }
     }
 
@@ -2509,7 +2518,8 @@ inline void ProximalAdagradUpdateDnsRspDnsImpl(
           static_cast<DType>(param.lr),
           static_cast<DType>(param.float_stable_epsilon),
           static_cast<DType>(param.bisection_epsilon), param.lazy_update,
-          param.decay_states, static_cast<DType>(param.decay_factor));
+          param.decay_states, static_cast<DType>(param.decay_factor),
+          param.lazy_decay);
     });
   });
 }
