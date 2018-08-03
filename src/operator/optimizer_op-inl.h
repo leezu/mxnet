@@ -2182,6 +2182,7 @@ struct ProximalAdagradParam : public dmlc::Parameter<ProximalAdagradParam> {
   bool decay_states;
   float decay_factor;
   bool lazy_decay;
+  bool groupwise_lr;
   DMLC_DECLARE_PARAMETER(ProximalAdagradParam) {
     DMLC_DECLARE_FIELD(lr).describe("Learning rate");
     DMLC_DECLARE_FIELD(rescale_grad)
@@ -2211,7 +2212,7 @@ struct ProximalAdagradParam : public dmlc::Parameter<ProximalAdagradParam> {
         .describe("If true, lazy updates are applied if gradient's stype is "
                   "row_sparse.");
     DMLC_DECLARE_FIELD(decay_states)
-      .set_default(true)
+      .set_default(false)
       .describe("Decay states as in RMSProp.");
     DMLC_DECLARE_FIELD(decay_factor)
       .set_default(0.9f)
@@ -2219,6 +2220,9 @@ struct ProximalAdagradParam : public dmlc::Parameter<ProximalAdagradParam> {
     DMLC_DECLARE_FIELD(lazy_decay)
       .set_default(true)
       .describe("If true, decay is applied lazily.");
+    DMLC_DECLARE_FIELD(groupwise_lr)
+      .set_default(false)
+      .describe("If true, only one learning rate per group is used.");
   }
 };
 
@@ -2460,6 +2464,100 @@ template <typename xpu> struct ProximalAdagradDnsRspKernel {
   }
 };
 
+/*! \brief kernel for sparse adagrad update with group sparsity regularization
+ */
+template <typename xpu> struct ProximalGroupAdagradDnsRspKernel {
+  template <typename DType, typename IType>
+  MSHADOW_XINLINE static void
+  Map(int i, const index_t row_length, DType *out_data,
+      DType *state_data, DType *weight_data, const IType *grad_idx,
+      const DType *grad_data, DType *last_update_data,
+      const DType current_update, const DType clip_gradient,
+      const DType rescale_grad, const DType l2_regularization_strength,
+      const DType lr, const DType eps) {
+    using namespace mshadow_op;
+
+    // Helper to obtain index into weight / state arrays
+    auto get_data_j = [&i, &grad_idx,
+                       &row_length](index_t j) -> index_t {
+        return grad_idx[i] * row_length + j;
+    };
+    // Helper to obtain explicit rescaled and clipped grad
+    auto get_grad_rescaled = [&i, &row_length, &grad_data, &rescale_grad,
+                              &clip_gradient](index_t j) -> DType {
+      index_t grad_j = i * row_length + j;
+      DType grad_rescaled = grad_data[grad_j] * rescale_grad;
+      if (clip_gradient >= 0.0f) {
+        grad_rescaled = clip::Map(grad_rescaled, clip_gradient);
+      }
+      return grad_rescaled;
+    };
+
+    // Compute number of weight updates skipped due to lazy_update
+    DType num_skipped = current_update - last_update_data[grad_idx[i]];
+    last_update_data[grad_idx[i]] = current_update;
+    // Warn in case of erroneous last_update_buffer
+    if (num_skipped < 0) {
+      num_skipped = 0;
+      std::printf("Got invalid last_update in proximal_adagrad_update. "
+                  "Using standard Adagrad update.\n");
+    }
+
+    // Update history states
+    DType grad_ssq = 0;
+    for (index_t j = 0; j < row_length; j++) {
+      const DType grad_rescaled = get_grad_rescaled(j);
+      grad_ssq += grad_rescaled * grad_rescaled;
+    }
+    state_data[grad_idx[i]] += grad_ssq / row_length;
+
+    DType scaled_sparsity = l2_regularization_strength * num_skipped * lr /
+                            square_root::Map(state_data[grad_idx[i]] + eps);
+    if (scaled_sparsity <= 0) {
+      // Standard Adagrad Update
+      for (index_t j = 0; j < row_length; j++) {
+        // clang-format off
+        const DType grad_rescaled = get_grad_rescaled(j);
+        index_t data_j = get_data_j(j);
+        const DType div = lr * grad_rescaled / square_root::Map(state_data[grad_idx[i]] + eps);
+        out_data[data_j] = weight_data[data_j] - div;
+        // clang-format on
+      }
+    } else {
+      // Compute L2 norm of updated parameter using scaled sum of squares
+      DType norm, scale;
+      mshadow_op::nrm2::SetInitValue(norm, scale);
+      for (index_t j = 0; j < row_length; j++) {
+        const DType grad_rescaled = get_grad_rescaled(j);
+        index_t data_j = get_data_j(j);
+        const DType val =
+          (weight_data[data_j] -
+           lr / std::sqrt(state_data[grad_idx[i]] + eps) *
+           grad_rescaled);
+        mshadow_op::nrm2::Reduce(norm, val, scale);
+      }
+      mshadow_op::nrm2::Finalize(norm, scale);
+
+      if (norm <= scaled_sparsity) {
+        // Soft threshold weights (proximal map for group lasso)
+        for (index_t j = 0; j < row_length; j++) {
+          index_t data_j = get_data_j(j);
+          out_data[data_j] = 0;
+        }
+      } else {
+        for (index_t j = 0; j < row_length; j++) {
+          // clang-format off
+          const DType grad_rescaled = get_grad_rescaled(j);
+          index_t data_j = get_data_j(j);
+          const DType div = lr * grad_rescaled / square_root::Map(state_data[grad_idx[i]] + eps);
+          out_data[data_j] = (weight_data[data_j] - div) * (1 - scaled_sparsity / norm);
+          // clang-format on
+        }
+      }
+    }
+  }
+};
+
 /*
  * \brief Adagrad update implementation for dense weight and row_sparse grad.
  *        Both standard update and lazy update are supported.
@@ -2508,18 +2606,32 @@ inline void ProximalAdagradUpdateDnsRspDnsImpl(
         return;
       }
 
-      Kernel<ProximalAdagradDnsRspKernel<xpu>, xpu>::Launch(
-          s, num_threads, row_length, num_grad, out_data, state_data,
-          weight_data, grad_idx, grad_val, last_update_data,
-          static_cast<DType>(param.current_update),
-          static_cast<DType>(param.clip_gradient),
-          static_cast<DType>(param.rescale_grad),
-          static_cast<DType>(param.l2_regularization_strength),
-          static_cast<DType>(param.lr),
-          static_cast<DType>(param.float_stable_epsilon),
-          static_cast<DType>(param.bisection_epsilon), param.lazy_update,
-          param.decay_states, static_cast<DType>(param.decay_factor),
-          param.lazy_decay);
+      if (param.groupwise_lr) {
+        CHECK_EQ(param.lazy_update, true);
+        CHECK_EQ(param.decay_states, false);
+        Kernel<ProximalGroupAdagradDnsRspKernel<xpu>, xpu>::Launch(
+            s, num_threads, row_length, out_data, state_data, weight_data,
+            grad_idx, grad_val, last_update_data,
+            static_cast<DType>(param.current_update),
+            static_cast<DType>(param.clip_gradient),
+            static_cast<DType>(param.rescale_grad),
+            static_cast<DType>(param.l2_regularization_strength),
+            static_cast<DType>(param.lr),
+            static_cast<DType>(param.float_stable_epsilon));
+      } else {
+        Kernel<ProximalAdagradDnsRspKernel<xpu>, xpu>::Launch(
+            s, num_threads, row_length, num_grad, out_data, state_data,
+            weight_data, grad_idx, grad_val, last_update_data,
+            static_cast<DType>(param.current_update),
+            static_cast<DType>(param.clip_gradient),
+            static_cast<DType>(param.rescale_grad),
+            static_cast<DType>(param.l2_regularization_strength),
+            static_cast<DType>(param.lr),
+            static_cast<DType>(param.float_stable_epsilon),
+            static_cast<DType>(param.bisection_epsilon), param.lazy_update,
+            param.decay_states, static_cast<DType>(param.decay_factor),
+            param.lazy_decay);
+      }
     });
   });
 }
