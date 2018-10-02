@@ -48,6 +48,8 @@ struct GroupAdagradParam : public dmlc::Parameter<GroupAdagradParam> {
   float epsilon;
   float rescale_grad;
   float clip_gradient;
+  float l2_regularization_strength;
+  float current_update;
   DMLC_DECLARE_PARAMETER(GroupAdagradParam) {
     DMLC_DECLARE_FIELD(lr).describe("Learning rate");
     DMLC_DECLARE_FIELD(rescale_grad)
@@ -59,6 +61,9 @@ struct GroupAdagradParam : public dmlc::Parameter<GroupAdagradParam> {
             "Clip gradient to the range of [-clip_gradient, clip_gradient] "
             "If clip_gradient <= 0, gradient clipping is turned off. "
             "grad = max(min(grad, clip_gradient), -clip_gradient).");
+    DMLC_DECLARE_FIELD(l2_regularization_strength)
+        .set_default(0.0f)
+        .describe("Lambda term for group lasso objective.");
     DMLC_DECLARE_FIELD(epsilon).set_default(1.0e-5).describe(
         "Epsilon for numerical stability");
   }
@@ -74,6 +79,7 @@ inline bool GroupAdagradStorageType(const nnvm::NodeAttrs &attrs,
   const int weight_stype = in_attrs->at(0);
   const int grad_stype = in_attrs->at(1);
   const int state_stype = in_attrs->at(2);
+  const int counter_stype = in_attrs->at(3);
   bool dispatched = false;
   if (!dispatched && common::ContainsOnlyStorage(*in_attrs, kDefaultStorage)) {
     // dns, ... -> dns
@@ -81,6 +87,7 @@ inline bool GroupAdagradStorageType(const nnvm::NodeAttrs &attrs,
                                      DispatchMode::kFCompute);
   }
   if (!dispatched && grad_stype == kRowSparseStorage &&
+      counter_stype == kDefaultStorage &&
       (weight_stype == kRowSparseStorage || weight_stype == kDefaultStorage) &&
       state_stype == weight_stype) {
     // weight and state share stype, grad's stype = rsp
@@ -98,8 +105,9 @@ template <typename xpu> struct GroupAdagradDnsRspKernel {
   MSHADOW_XINLINE static void
   Map(int i, const index_t row_length, DType *out_data, DType *state_data,
       DType *weight_data, const IType *grad_idx, const DType *grad_data,
-      const DType clip_gradient, const DType rescale_grad, const DType lr,
-      const DType eps) {
+      DType *last_update_data, const DType current_update,
+      const DType clip_gradient, const DType rescale_grad,
+      const DType l2_regularization_strength, const DType lr, const DType eps) {
     using namespace mshadow_op;
 
     // Helper to obtain index into weight / state arrays
@@ -125,14 +133,70 @@ template <typename xpu> struct GroupAdagradDnsRspKernel {
     }
     state_data[grad_idx[i]] += grad_ssq / row_length;
 
-    // Standard Adagrad Update
-    for (index_t j = 0; j < row_length; j++) {
-      // clang-format off
-      const DType grad_rescaled = get_grad_rescaled(j);
-      index_t data_j = get_data_j(j);
-      const DType div = lr * grad_rescaled / square_root::Map(state_data[grad_idx[i]] + eps);
-      out_data[data_j] = weight_data[data_j] - div;
-      // clang-format on
+    // Number of weight updates skipped due to lazy_update
+    DType delay{0};
+    if (l2_regularization_strength > 0) {
+      // last_update_data[grad_idx[i]] is only valid if
+      // l2_regularization_strength > 0. Otherwise may be out of bounds read.
+      delay = current_update - last_update_data[grad_idx[i]];
+      last_update_data[grad_idx[i]] = current_update;
+    }
+
+    if (l2_regularization_strength <= 0 || delay < 0) {
+      if (delay < 0) {
+        std::printf("Got invalid last_update in proximal_adagrad_update. "
+                    "Using standard Adagrad update.\n");
+      }
+
+      // Standard Adagrad Update
+      for (index_t j = 0; j < row_length; j++) {
+        // clang-format off
+        const DType grad_rescaled = get_grad_rescaled(j);
+        index_t data_j = get_data_j(j);
+        const DType div = lr * grad_rescaled / square_root::Map(state_data[grad_idx[i]] + eps);
+        out_data[data_j] = weight_data[data_j] - div;
+        // clang-format on
+      }
+    } else {
+      // Compute L2 norm of updated parameter using scaled sum of squares
+      DType norm, scale;
+      mshadow_op::nrm2::SetInitValue(norm, scale);
+      for (index_t j = 0; j < row_length; j++) {
+        const DType grad_rescaled = get_grad_rescaled(j);
+        index_t data_j = get_data_j(j);
+        const DType val =
+            (weight_data[data_j] -
+             lr / std::sqrt(state_data[grad_idx[i]] + eps) * grad_rescaled);
+        mshadow_op::nrm2::Reduce(norm, val, scale);
+      }
+      mshadow_op::nrm2::Finalize(norm, scale);
+
+      // Compute regularization lambda
+      DType lambda = l2_regularization_strength * lr /
+                     square_root::Map(state_data[grad_idx[i]] + eps);
+      DType l2_scale = 1 - lambda / norm;
+      if (l2_scale < 0) {
+        l2_scale = 0;
+      } else if (l2_scale > 0) {
+        scale = math::pow(scale, delay);
+      }
+
+      if (l2_scale == 0) {
+        // Soft threshold weights (proximal map for group lasso)
+        for (index_t j = 0; j < row_length; j++) {
+          index_t data_j = get_data_j(j);
+          out_data[data_j] = 0;
+        }
+      } else {
+        for (index_t j = 0; j < row_length; j++) {
+          // clang-format off
+          const DType grad_rescaled = get_grad_rescaled(j);
+          index_t data_j = get_data_j(j);
+          const DType div = lr * grad_rescaled / square_root::Map(state_data[grad_idx[i]] + eps);
+          out_data[data_j] = (weight_data[data_j] - div) * l2_scale;
+          // clang-format on
+        }
+      }
     }
   }
 };
@@ -144,7 +208,8 @@ template <typename xpu> struct GroupAdagradDnsRspKernel {
 template <typename xpu>
 inline void GroupAdagradUpdateDnsRspDnsImpl(
     const GroupAdagradParam &param, const OpContext &ctx, const TBlob &weight,
-    const NDArray &grad, const TBlob &state, const OpReqType &req, TBlob *out) {
+    const NDArray &grad, const TBlob &state, const TBlob &last_update,
+    const OpReqType &req, TBlob *out) {
   using namespace mshadow;
   using namespace mshadow::expr;
   using namespace mshadow_op;
@@ -167,6 +232,7 @@ inline void GroupAdagradUpdateDnsRspDnsImpl(
       const IType *grad_idx = grad.aux_data(rowsparse::kIdx).dptr<IType>();
       const DType *grad_val = grad.data().dptr<DType>();
       DType *state_data = state.dptr<DType>();
+      DType *last_update_data = last_update.dptr<DType>();
       const nnvm::dim_t num_grad = grad.aux_shape(rowsparse::kIdx)[0];
       const auto row_length = weight.shape_.ProdShape(1, weight.ndim());
 
@@ -177,9 +243,11 @@ inline void GroupAdagradUpdateDnsRspDnsImpl(
 
       Kernel<GroupAdagradDnsRspKernel<xpu>, xpu>::Launch(
           s, num_grad, row_length, out_data, state_data, weight_data, grad_idx,
-          grad_val, static_cast<DType>(param.clip_gradient),
-          static_cast<DType>(param.rescale_grad), static_cast<DType>(param.lr),
-          static_cast<DType>(param.epsilon));
+          grad_val, last_update_data, static_cast<DType>(param.current_update),
+          static_cast<DType>(param.clip_gradient),
+          static_cast<DType>(param.rescale_grad),
+          static_cast<DType>(param.l2_regularization_strength),
+          static_cast<DType>(param.lr), static_cast<DType>(param.epsilon));
     });
   });
 }
@@ -189,11 +257,10 @@ inline void GroupAdagradUpdateDnsRspDnsImpl(
  *        update and lazy update are supported.
  */
 template <typename xpu>
-inline void
-GroupAdagradUpdateRspRspRspImpl(const GroupAdagradParam &param,
-                                const OpContext &ctx, const NDArray &weight,
-                                const NDArray &grad, const NDArray &state,
-                                const OpReqType &req, NDArray *out) {
+inline void GroupAdagradUpdateRspRspRspImpl(
+    const GroupAdagradParam &param, const OpContext &ctx, const NDArray &weight,
+    const NDArray &grad, const NDArray &state, const NDArray &last_update,
+    const OpReqType &req, NDArray *out) {
   using namespace mshadow;
   using namespace mxnet_op;
   using namespace rowsparse;
@@ -209,7 +276,8 @@ GroupAdagradUpdateRspRspRspImpl(const GroupAdagradParam &param,
   // reuse dns rsp implementation when storage_shape == shape
   TBlob out_blob = out->data();
   GroupAdagradUpdateDnsRspDnsImpl<xpu>(param, ctx, weight.data(), grad,
-                                       state.data(), req, &out_blob);
+                                       state.data(), last_update.data(), req,
+                                       &out_blob);
 }
 
 template <typename xpu>
@@ -222,26 +290,29 @@ inline void GroupAdagradUpdateEx(const nnvm::NodeAttrs &attrs,
   const auto weight_stype = inputs[0].storage_type();
   const auto grad_stype = inputs[1].storage_type();
   const auto state_stype = inputs[2].storage_type();
+  const auto counter_stype = inputs[3].storage_type();
   const auto output_stype = outputs[0].storage_type();
 
   if (state_stype == weight_stype && output_stype == weight_stype &&
-      weight_stype == kRowSparseStorage && grad_stype == kRowSparseStorage) {
+      weight_stype == kRowSparseStorage && counter_stype == kDefaultStorage &&
+      grad_stype == kRowSparseStorage) {
     NDArray out = outputs[0];
     GroupAdagradUpdateRspRspRspImpl<xpu>(param, ctx, inputs[0], inputs[1],
-                                         inputs[2], req[0], &out);
+                                         inputs[2], inputs[3], req[0], &out);
   } else if (state_stype == weight_stype && output_stype == weight_stype &&
              weight_stype == kDefaultStorage &&
+             counter_stype == kDefaultStorage &&
              grad_stype == kRowSparseStorage) {
     TBlob out_blob = outputs[0].data();
     GroupAdagradUpdateDnsRspDnsImpl<xpu>(param, ctx, inputs[0].data(),
-                                         inputs[1], inputs[2].data(), req[0],
-                                         &out_blob);
+                                         inputs[1], inputs[2].data(),
+                                         inputs[3].data(), req[0], &out_blob);
   } else {
     LogUnimplementedOp(attrs, ctx, inputs, req, outputs);
   }
 }
 
-}  // namespace op
-}  // namespace mxnet
+} // namespace op
+} // namespace mxnet
 
-#endif  // MXNET_OPERATOR_CONTRIB_OPTIMIZER_OP_INL_H_
+#endif // MXNET_OPERATOR_CONTRIB_OPTIMIZER_OP_INL_H_
