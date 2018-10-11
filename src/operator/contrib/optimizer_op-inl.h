@@ -45,11 +45,15 @@ namespace op {
 
 struct GroupAdagradParam : public dmlc::Parameter<GroupAdagradParam> {
   float lr;
+  float lars_trust;
   float epsilon;
   float rescale_grad;
   float clip_gradient;
   DMLC_DECLARE_PARAMETER(GroupAdagradParam) {
     DMLC_DECLARE_FIELD(lr).describe("Learning rate");
+    DMLC_DECLARE_FIELD(lars_trust)
+        .describe("LARS trust paramter. Ignored if <= 0.")
+        .set_default(-1.0f);
     DMLC_DECLARE_FIELD(rescale_grad)
         .set_default(1.0f)
         .describe("Rescale gradient to grad = rescale_grad*grad.");
@@ -99,7 +103,7 @@ template <typename xpu> struct GroupAdagradDnsRspKernel {
   Map(int i, const index_t row_length, DType *out_data, DType *state_data,
       DType *weight_data, const IType *grad_idx, const DType *grad_data,
       const DType clip_gradient, const DType rescale_grad, const DType lr,
-      const DType eps) {
+      const DType lars_trust, const DType eps) {
     using namespace mshadow_op;
 
     // Helper to obtain index into weight / state arrays
@@ -117,10 +121,35 @@ template <typename xpu> struct GroupAdagradDnsRspKernel {
       return grad_rescaled;
     };
 
+    // LARS
+    DType trust_ratio = 1;
+    if (lars_trust > 0) {
+      DType weight_norm, weight_scale;
+      mshadow_op::nrm2::SetInitValue(weight_norm, weight_scale);
+      for (index_t j = 0; j < row_length; j++) {
+        index_t data_j = grad_idx[i] * row_length + j;
+        mshadow_op::nrm2::Reduce(weight_norm, weight_data[data_j],
+                                 weight_scale);
+      }
+      mshadow_op::nrm2::Finalize(weight_norm, weight_scale);
+      DType grad_norm, grad_scale;
+      mshadow_op::nrm2::SetInitValue(grad_norm, grad_scale);
+      for (index_t j = 0; j < row_length; j++) {
+        index_t grad_j = i * row_length + j;
+        mshadow_op::nrm2::Reduce(grad_norm, grad_data[grad_j], grad_scale);
+      }
+      mshadow_op::nrm2::Finalize(grad_norm, grad_scale);
+
+      // Local learning rate
+      if (weight_norm > 0 && grad_norm > 0) {
+        trust_ratio = lars_trust * weight_norm / grad_norm;
+      }
+    }
+
     // Update history states
     DType grad_ssq = 0;
     for (index_t j = 0; j < row_length; j++) {
-      const DType grad_rescaled = get_grad_rescaled(j);
+      const DType grad_rescaled = get_grad_rescaled(j) * trust_ratio;
       grad_ssq += grad_rescaled * grad_rescaled;
     }
     state_data[grad_idx[i]] += grad_ssq / row_length;
@@ -130,7 +159,7 @@ template <typename xpu> struct GroupAdagradDnsRspKernel {
       // clang-format off
       const DType grad_rescaled = get_grad_rescaled(j);
       index_t data_j = get_data_j(j);
-      const DType div = lr * grad_rescaled / square_root::Map(state_data[grad_idx[i]] + eps);
+      const DType div = lr * grad_rescaled * trust_ratio / square_root::Map(state_data[grad_idx[i]] + eps);
       out_data[data_j] = weight_data[data_j] - div;
       // clang-format on
     }
@@ -179,6 +208,7 @@ inline void GroupAdagradUpdateDnsRspDnsImpl(
           s, num_grad, row_length, out_data, state_data, weight_data, grad_idx,
           grad_val, static_cast<DType>(param.clip_gradient),
           static_cast<DType>(param.rescale_grad), static_cast<DType>(param.lr),
+          static_cast<DType>(param.lars_trust),
           static_cast<DType>(param.epsilon));
     });
   });

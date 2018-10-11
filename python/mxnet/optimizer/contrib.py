@@ -58,9 +58,10 @@ class GroupAdaGrad(Optimizer):
 
     """
 
-    def __init__(self, eps=1e-5, **kwargs):
+    def __init__(self, eps=1e-5, lars_trust=-1, **kwargs):
         super(GroupAdaGrad, self).__init__(**kwargs)
         self.float_stable_eps = eps
+        self.lars_trust = lars_trust
 
     def create_state(self, index, weight):
         assert len(weight.shape) == 2
@@ -80,7 +81,8 @@ class GroupAdaGrad(Optimizer):
         if is_sparse:
             kwargs = {
                 'epsilon': self.float_stable_eps,
-                'rescale_grad': self.rescale_grad
+                'rescale_grad': self.rescale_grad,
+                'lars_trust': self.lars_trust
             }
             if self.clip_gradient:
                 kwargs['clip_gradient'] = self.clip_gradient
