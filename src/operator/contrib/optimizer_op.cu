@@ -32,5 +32,8 @@ namespace op {
 NNVM_REGISTER_OP(_contrib_group_adagrad_update)
 .set_attr<FComputeEx>("FComputeEx<gpu>", GroupAdagradUpdateEx<gpu>);
 
+NNVM_REGISTER_OP(_contrib_embedding_ars_update)
+.set_attr<FComputeEx>("FComputeEx<gpu>", EmbeddingARSUpdateEx<gpu>);
+
 }  // namespace op
 }  // namespace mxnet

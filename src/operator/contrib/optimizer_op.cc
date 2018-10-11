@@ -30,6 +30,7 @@ namespace mxnet {
 namespace op {
 
 DMLC_REGISTER_PARAMETER(GroupAdagradParam);
+DMLC_REGISTER_PARAMETER(EmbeddingARSParam);
 
 /*!
  * \brief Shape inference function for Group AdaGrad.
@@ -85,6 +86,39 @@ Note that non-zero values for the weight decay option are not supported.
 .add_argument("history", "NDArray-or-Symbol", "History")
 .add_argument("last_update", "NDArray-or-Symbol", "Array storing last update counter for each row.")
 .add_arguments(GroupAdagradParam::__FIELDS__());
+
+
+/*!
+ * \brief Shape inference function for Group AdaGrad.
+ */
+inline bool EmbeddingARSShape(const nnvm::NodeAttrs &attrs,
+                              std::vector<TShape> *in_attrs,
+                              std::vector<TShape> *out_attrs) {
+  CHECK_EQ(in_attrs->size(), 2U);
+  CHECK_EQ(out_attrs->size(), 1U);
+
+  SHAPE_ASSIGN_CHECK(*out_attrs, 0, in_attrs->at(0));
+  SHAPE_ASSIGN_CHECK(*out_attrs, 0, in_attrs->at(1));
+  SHAPE_ASSIGN_CHECK(*in_attrs, 0, out_attrs->at(0));
+  SHAPE_ASSIGN_CHECK(*in_attrs, 1, out_attrs->at(0));
+
+  return out_attrs->at(0).ndim() != 0U && out_attrs->at(0).Size() != 0U &&
+         (in_attrs->at(0)[0] == in_attrs->at(1)[0]);
+}
+
+NNVM_REGISTER_OP(_contrib_embedding_ars_update)
+.describe(R"code(Update function for embedding-vector adaptive rate scaling optimizer.
+)code" ADD_FILELINE)
+.set_num_inputs(2)
+.set_num_outputs(1)
+.set_attr_parser(ParamParser<EmbeddingARSParam>)
+.set_attr<nnvm::FInferShape>("FInferShape", EmbeddingARSShape)
+.set_attr<nnvm::FInferType>("FInferType", ElemwiseType<2, 1>)
+.set_attr<FInferStorageType>("FInferStorageType", EmbeddingARSStorageType)
+.set_attr<FComputeEx>("FComputeEx<cpu>", EmbeddingARSUpdateEx<cpu>)
+.add_argument("weight", "NDArray-or-Symbol", "Weight")
+.add_argument("grad", "NDArray-or-Symbol", "Gradient")
+.add_arguments(EmbeddingARSParam::__FIELDS__());
 
 }  // namespace op
 }  // namespace mxnet

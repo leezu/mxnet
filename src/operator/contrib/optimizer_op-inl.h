@@ -241,6 +241,190 @@ inline void GroupAdagradUpdateEx(const nnvm::NodeAttrs &attrs,
   }
 }
 
+struct EmbeddingARSParam : public dmlc::Parameter<EmbeddingARSParam> {
+  float lr;
+  float trust;
+  float epsilon;
+  float rescale_grad;
+  float clip_gradient;
+  DMLC_DECLARE_PARAMETER(EmbeddingARSParam) {
+    DMLC_DECLARE_FIELD(lr).describe("Base learning rate");
+    DMLC_DECLARE_FIELD(trust).describe("LARS trust coefficient η");
+    DMLC_DECLARE_FIELD(epsilon).describe("Epsilon for numerical stability");
+    DMLC_DECLARE_FIELD(rescale_grad)
+        .set_default(1.0f)
+        .describe("Rescale gradient to grad = rescale_grad*grad.");
+    DMLC_DECLARE_FIELD(clip_gradient)
+        .set_default(-1.0f)
+        .describe(
+            "Clip gradient to the range of [-clip_gradient, clip_gradient] "
+            "If clip_gradient <= 0, gradient clipping is turned off. "
+            "grad = max(min(grad, clip_gradient), -clip_gradient).");
+  }
+};
+
+inline bool EmbeddingARSStorageType(const nnvm::NodeAttrs &attrs,
+                                    const int dev_mask,
+                                    DispatchMode *dispatch_mode,
+                                    std::vector<int> *in_attrs,
+                                    std::vector<int> *out_attrs) {
+  CHECK_EQ(in_attrs->size(), 2U);
+  CHECK_EQ(out_attrs->size(), 1U);
+  const int weight_stype = in_attrs->at(0);
+  const int grad_stype = in_attrs->at(1);
+  bool dispatched = false;
+  if (!dispatched && common::ContainsOnlyStorage(*in_attrs, kDefaultStorage)) {
+    // dns, ... -> dns
+    dispatched = storage_type_assign(out_attrs, kDefaultStorage, dispatch_mode,
+                                     DispatchMode::kFCompute);
+  }
+  if (!dispatched && grad_stype == kRowSparseStorage &&
+      (weight_stype == kRowSparseStorage || weight_stype == kDefaultStorage)) {
+    dispatched = storage_type_assign(
+        out_attrs, static_cast<NDArrayStorageType>(weight_stype), dispatch_mode,
+        DispatchMode::kFComputeEx);
+  }
+  return dispatched;
+}
+
+/*! \brief kernel for sparse adagrad update with group sparsity regularization
+ */
+template <typename xpu> struct EmbeddingARSDnsRspKernel {
+  template <typename DType, typename IType>
+  MSHADOW_XINLINE static void
+  Map(int i, const index_t row_length, DType *out_data, DType *weight_data,
+      const IType *grad_idx, const DType *grad_data, const DType clip_gradient,
+      const DType rescale_grad, const DType lr, const DType trust,
+      const DType eps) {
+    using namespace mshadow_op;
+
+    // Compute weight norm using scaled sum of squares
+    DType weight_norm, weight_scale;
+    mshadow_op::nrm2::SetInitValue(weight_norm, weight_scale);
+    for (index_t j = 0; j < row_length; j++) {
+      index_t data_j = grad_idx[i] * row_length + j;
+      mshadow_op::nrm2::Reduce(weight_norm, weight_data[data_j], weight_scale);
+    }
+    mshadow_op::nrm2::Finalize(weight_norm, weight_scale);
+    DType grad_norm, grad_scale;
+    mshadow_op::nrm2::SetInitValue(grad_norm, grad_scale);
+    for (index_t j = 0; j < row_length; j++) {
+      index_t grad_j = i * row_length + j;
+      mshadow_op::nrm2::Reduce(grad_norm, grad_data[grad_j], grad_scale);
+    }
+    mshadow_op::nrm2::Finalize(grad_norm, grad_scale);
+
+    // Local learning rate
+    DType trust_ratio = 1;
+    if (weight_norm > 0 && grad_norm > 0) {
+      trust_ratio = trust * weight_norm / grad_norm;
+    }
+
+    // Update
+    for (index_t j = 0; j < row_length; j++) {
+      index_t grad_j = i * row_length + j;
+      DType grad_rescaled = grad_data[grad_j] * rescale_grad;
+      if (clip_gradient >= 0.0f) {
+        grad_rescaled = clip::Map(grad_rescaled, clip_gradient);
+      }
+
+      index_t data_j = grad_idx[i] * row_length + j;
+      out_data[data_j] = weight_data[data_j] - lr * trust_ratio * grad_rescaled;
+    }
+  }
+};
+
+/*
+ * \brief LARS for Embedding update implementation for dense weight and
+ * row_sparse grad.
+ */
+template <typename xpu>
+inline void EmbeddingARSUpdateDnsRspDnsImpl(const EmbeddingARSParam &param,
+                                            const OpContext &ctx,
+                                            const TBlob &weight,
+                                            const NDArray &grad,
+                                            const OpReqType &req, TBlob *out) {
+  using namespace mshadow;
+  using namespace mshadow::expr;
+  using namespace mshadow_op;
+  using namespace mxnet_op;
+  Stream<xpu> *s = ctx.get_stream<xpu>();
+  CHECK_EQ(grad.storage_type(), kRowSparseStorage);
+  // if gradients are zeros, no weights are updated
+  if (req == kNullOp) {
+    return;
+  }
+  CHECK_EQ(req, kWriteInplace)
+      << "kWriteInplace is expected for sparse group_adagrad_update";
+  CHECK_GT(weight.shape_.Size(), 0);
+
+  MSHADOW_REAL_TYPE_SWITCH(weight.type_flag_, DType, {
+    MSHADOW_IDX_TYPE_SWITCH(grad.aux_type(rowsparse::kIdx), IType, {
+      DType *weight_data = weight.dptr<DType>();
+      DType *out_data = out->dptr<DType>();
+      const IType *grad_idx = grad.aux_data(rowsparse::kIdx).dptr<IType>();
+      const DType *grad_val = grad.data().dptr<DType>();
+      const nnvm::dim_t num_grad = grad.aux_shape(rowsparse::kIdx)[0];
+      const auto row_length = weight.shape_.ProdShape(1, weight.ndim());
+
+      if (!grad.storage_initialized()) {
+        // Lazy update with 0 gradient
+        return;
+      }
+
+      Kernel<EmbeddingARSDnsRspKernel<xpu>, xpu>::Launch(
+          s, num_grad, row_length, out_data, weight_data, grad_idx, grad_val,
+          static_cast<DType>(param.clip_gradient),
+          static_cast<DType>(param.rescale_grad), static_cast<DType>(param.lr),
+          static_cast<DType>(param.trust), static_cast<DType>(param.epsilon));
+    });
+  });
+}
+
+/*
+ * \brief AdaGrad update implementation for row_sparse grad. Both standard
+ *        update and lazy update are supported.
+ */
+template <typename xpu>
+inline void EmbeddingARSUpdateRspRspRspImpl(
+    const EmbeddingARSParam &param, const OpContext &ctx, const NDArray &weight,
+    const NDArray &grad, const OpReqType &req, NDArray *out) {
+  using namespace mshadow;
+  using namespace mxnet_op;
+  using namespace rowsparse;
+  CheckAllRowsPresent(weight, "EmbeddingARSUpdate", "weights");
+  // reuse dns rsp implementation when storage_shape == shape
+  TBlob out_blob = out->data();
+  EmbeddingARSUpdateDnsRspDnsImpl<xpu>(param, ctx, weight.data(), grad, req,
+                                       &out_blob);
+}
+
+template <typename xpu>
+inline void EmbeddingARSUpdateEx(const nnvm::NodeAttrs &attrs,
+                                 const OpContext &ctx,
+                                 const std::vector<NDArray> &inputs,
+                                 const std::vector<OpReqType> &req,
+                                 const std::vector<NDArray> &outputs) {
+  const EmbeddingARSParam &param = nnvm::get<EmbeddingARSParam>(attrs.parsed);
+  const auto weight_stype = inputs[0].storage_type();
+  const auto grad_stype = inputs[1].storage_type();
+  const auto output_stype = outputs[0].storage_type();
+
+  if (output_stype == weight_stype && weight_stype == kRowSparseStorage &&
+      grad_stype == kRowSparseStorage) {
+    NDArray out = outputs[0];
+    EmbeddingARSUpdateRspRspRspImpl<xpu>(param, ctx, inputs[0], inputs[1],
+                                         req[0], &out);
+  } else if (output_stype == weight_stype && weight_stype == kDefaultStorage &&
+             grad_stype == kRowSparseStorage) {
+    TBlob out_blob = outputs[0].data();
+    EmbeddingARSUpdateDnsRspDnsImpl<xpu>(param, ctx, inputs[0].data(),
+                                         inputs[1], req[0], &out_blob);
+  } else {
+    LogUnimplementedOp(attrs, ctx, inputs, req, outputs);
+  }
+}
+
 }  // namespace op
 }  // namespace mxnet
 
