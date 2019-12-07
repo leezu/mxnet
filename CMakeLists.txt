@@ -434,19 +434,6 @@ else(USE_OPENCV)
   add_definitions(-DMXNET_USE_OPENCV=0)
 endif()
 
-# ---[ OpenMP
-if(USE_OPENMP)
-  find_package(OpenMP REQUIRED)
-
-  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${OpenMP_C_FLAGS}")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
-  set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${OpenMP_EXE_LINKER_FLAGS}")
-  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${OpenMP_EXE_LINKER_FLAGS}")
-
-elseif(UNIX AND NOT ANDROID)
-  list(APPEND mxnet_LINKER_LIBS pthread)
-endif()
-
 
 # ---[ LAPack
 if(USE_LAPACK)
@@ -696,6 +683,15 @@ else()
   add_library(mxnet SHARED ${SOURCE})
   target_compile_options(sample_lib PUBLIC /LD)
   set_target_properties(sample_lib PROPERTIES PREFIX "lib")
+endif()
+
+# ---[ OpenMP
+if(USE_OPENMP)
+  find_package(OpenMP REQUIRED)
+  target_link_libraries(mxnet PUBLIC OpenMP::OpenMP_CXX)
+  target_link_libraries(mxnet_static PUBLIC OpenMP::OpenMP_CXX)
+elseif(UNIX AND NOT ANDROID)
+  list(APPEND mxnet_LINKER_LIBS pthread)
 endif()
 
 if(USE_CUDA)
