@@ -1,6 +1,7 @@
 [submodule "3rdparty/dmlc-core"]
 	path = 3rdparty/dmlc-core
-	url = https://github.com/dmlc/dmlc-core.git
+	url = https://github.com/leezu/dmlc-core.git
+	branch = omp
 [submodule "3rdparty/ps-lite"]
 	path = 3rdparty/ps-lite
 	url = https://github.com/dmlc/ps-lite
@@ -16,7 +17,8 @@
 	branch = master
 [submodule "3rdparty/tvm"]
 	path = 3rdparty/tvm
-	url = https://github.com/apache/incubator-tvm.git
+	url = https://github.com/leezu/tvm.git
+	branch = omp
 [submodule "3rdparty/onnx-tensorrt"]
 	path = 3rdparty/onnx-tensorrt
 	url = https://github.com/onnx/onnx-tensorrt.git
