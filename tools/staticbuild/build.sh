@@ -22,68 +22,81 @@ if [ $# -lt 1 ]; then
 fi
 
 export CURDIR=$PWD
-export DEPS_PATH=$PWD/staticdeps
 export VARIANT=$(echo $1 | tr '[:upper:]' '[:lower:]')
 export PLATFORM=$(uname | tr '[:upper:]' '[:lower:]')
 
-if [[ $VARIANT == darwin* ]]; then
-    export VARIANT="darwin"
-fi
-
-NUM_PROC=1
-if [[ ! -z $(command -v nproc) ]]; then
-    NUM_PROC=$(nproc)
-elif [[ ! -z $(command -v sysctl) ]]; then
-    NUM_PROC=$(sysctl -n hw.ncpu)
-else
-    >&2 echo "Can't discover number of cores."
-fi
-export NUM_PROC
->&2 echo "Using $NUM_PROC parallel jobs in building."
-
-if [[ $DEBUG -eq 1 ]]; then
-    export ADD_MAKE_FLAG="-j $NUM_PROC"
-else
-    export ADD_MAKE_FLAG="--quiet -j $NUM_PROC"
-fi
-export MAKE="make $ADD_MAKE_FLAG"
-
-if [[ $VARIANT == "cu"* ]]; then
-    export CC="gcc"
-    export CXX="g++"
-    export CFLAGS="-fPIC -mno-avx"
-    export CXXFLAGS="-fPIC -mno-avx"
-    export FC="gfortran"
-else
-    export CC="clang"
-    export CXX="clang++"
-    export CFLAGS="-fPIC -mno-avx"
-    export CXXFLAGS="-fPIC -mno-avx"
-    export FC="/usr/local/flang/bin/flang"
-fi
-export PKG_CONFIG_PATH=$DEPS_PATH/lib/pkgconfig:$DEPS_PATH/lib64/pkgconfig:$DEPS_PATH/lib/x86_64-linux-gnu/pkgconfig:$PKG_CONFIG_PATH
-export CPATH=$DEPS_PATH/include:$CPATH
-
-if [[ -z "$USE_SYSTEM_CUDA" && $PLATFORM == 'linux' && $VARIANT == cu* ]]; then
-    source tools/setup_gpu_build_tools.sh $VARIANT $DEPS_PATH
-fi
-
-mkdir -p $DEPS_PATH
-
-# Build Dependencies
-source tools/dependencies/make_shared_dependencies.sh
-
 # Copy LICENSE
 mkdir -p licenses
-cp tools/dependencies/LICENSE.binary.dependencies licenses/
+cp tools/staticbuild/LICENSE.binary.dependencies licenses/
 cp NOTICE licenses/
 cp LICENSE licenses/
 cp DISCLAIMER-WIP licenses/
 
 
 # Build mxnet
-if [[ -z "$CMAKE_STATICBUILD" ]]; then
-    source tools/staticbuild/build_lib.sh
+options=""
+if [[ "$VARIANT" == "cu"* ]]; then
+    options+=" -o cuda=True"
+elif [[ "$VARIANT" == "native" ]]; then
+    options+=" -o cuda=False -o dnnl=False"
+elif [[ "$VARIANT" == "cpu" ]]; then
+    options+=" -o cuda=False"
 else
-    source tools/staticbuild/build_lib_cmake.sh
+    echo Invalid variant $VARIANT
+    exit 1
+fi
+if [[ "$PLATFORM" == "darwin" ]]; then
+    options+=" -o openmp=False -o blas=apple -o opencv:openblas=False"
+fi
+git submodule update --init --recursive || true
+
+# Check usage of correct C++ ABI
+conan profile new default --detect || true  # Generate conan default profile if it does not exist already
+if [[ $(conan profile get settings.compiler default) == 'gcc' &&
+          $(conan profile get settings.compiler.version default) -ge 5 &&
+          $(conan profile get settings.compiler.libcxx default) == 'libstdc++' ]]; then
+    echo "WARNING: You are using GCC>=5 but targeting the old libstdc++ ABI. This is not supported for building MXNet."
+    echo "We updated your default profile to target the libstdc++11 ABI."
+    echo "See https://docs.conan.io/en/latest/howtos/manage_gcc_abi.html for more information"
+    conan profile update settings.compiler.libcxx=libstdc++11 default
+fi;
+
+# Deploy an extended settings.yml introducing os.force_build_from_source to
+# prevent conan from downloading pre-built artifacts (for which we have no
+# guarantee about their glibc requirements) while still enabling conan to re-use
+# locally cached artifacts. See https://github.com/conan-io/conan/issues/7117
+tmpfile=$(mktemp)
+# zip the settings.yml
+zip -r - conan/settings.yml > $tmpfile
+conan config install $tmpfile
+
+# Register local conan recipes
+conan export conan/recipes/openblas
+
+# Build libmxnet.so
+rm -rf build; mkdir build; cd build
+conan install .. ${options} -s os.force_build_from_source=True --build missing
+conan build ..  # build mxnet
+cd -
+
+# Move to lib
+rm -rf lib; mkdir lib;
+if [[ $PLATFORM == 'linux' ]]; then
+    cp -L build/libmxnet.so lib/libmxnet.so
+    cp -L $(ldd lib/libmxnet.so | grep libgfortran |  awk '{print $3}') lib/
+    cp -L $(ldd lib/libmxnet.so | grep libquadmath |  awk '{print $3}') lib/
+elif [[ $PLATFORM == 'darwin' ]]; then
+    cp -L build/libmxnet.dylib lib/libmxnet.dylib
+fi
+
+# Print the linked objects on libmxnet.so
+>&2 echo "Checking linked objects on libmxnet.so..."
+if [[ ! -z $(command -v readelf) ]]; then
+    readelf -d lib/libmxnet.so
+    strip --strip-unneeded lib/libmxnet.so
+elif [[ ! -z $(command -v otool) ]]; then
+    otool -L lib/libmxnet.dylib
+    strip -u -r -x lib/libmxnet.dylib
+else
+    >&2 echo "Not available"
 fi

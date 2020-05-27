@@ -20,43 +20,24 @@
 This folder contains the core script used to build the static library. This README provides information on how to use the scripts in this folder. Please be aware, all of the scripts are designed to be run under the root folder.
 
 ## `build.sh`
-This script is a wrapper around `build_lib.sh. It simplifies the build by
-automatically identifing the system version, number of cores, and all
-environment variable settings. Here are examples you can run with this script:
+This script is simplifies the build. It relies on `conan` to ensure all static
+dependencies are built correcty and to manage the build of MXNet. You need to
+install `patchelf` first, for example via `apt install patchelf` on Ubuntu
+systems. Further you need cmake and conan, which you can install via `pip
+install cmake conan`.
+
+Here are examples you can run with this script:
 
 ```
 tools/staticbuild/build.sh cu102
 ```
-This would build the mxnet package based on CUDA 10.2. Currently, we support variants cpu, native, cu92, cu100, cu101 and cu102. All of these variants expect native have MKL-DNN backend enabled. 
+This would build the mxnet package based on CUDA 10.2. Currently, we support variants cpu, native, cu92, cu100, cu101 and cu102. All of these variants except native have oneDNN backend enabled. 
 
 ```
 tools/staticbuild/build.sh cpu
 ```
 
-This would build the mxnet package based on MKL-DNN.
-
-To use CMake to build the `libmxnet.so` instead of the deprecated Makefile based
-build logic, set the `CMAKE_STATICBUILD` environment variable. For example
-
-```
-CMAKE_STATICBUILD=1 tools/staticbuild/build.sh cpu
-```
-
-For the CMake build, you need to install `patchelf` first, for example via `apt
-install patchelf` on Ubuntu systems.
-
-As the result, users would have a complete static dependencies in `/staticdeps` in the root folder as well as a static-linked `libmxnet.so` file lives in `lib`. You can build your language binding by using the `libmxnet.so`.
-
-## `build_lib.sh`
-This script clones the most up-to-date master and builds the MXNet backend with a static library. In order to run the static library, you must set the following environment variables:
-
-- `DEPS_PATH` Path to your static dependencies
-- `PLATFORM` linux, darwin
-- `VARIANT` cpu, cu*
-
-It is not recommended to run this file alone since there are a bunch of variables need to be set.
-
-After running this script, you would have everything you need ready in the `/lib` folder.
+This would build the mxnet package based on oneDNN.
 
 ## `build_wheel.sh`
 This script builds the python package. It also runs a sanity test.

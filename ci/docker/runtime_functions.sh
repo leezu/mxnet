@@ -1929,8 +1929,6 @@ checkout() {
 build_static_libmxnet() {
     set -ex
     pushd .
-    export USE_SYSTEM_CUDA=1
-    export CMAKE_STATICBUILD=1
     local mxnet_variant=${1:?"This function requires a python command as the first argument"}
     if [[ $mxnet_variant == cu* ]]; then
         source /opt/rh/devtoolset-7/enable
@@ -2019,30 +2017,6 @@ build_static_python_cu92() {
     set -ex
     pushd .
     export mxnet_variant=cu92
-    export USE_SYSTEM_CUDA=1
-    source /opt/rh/devtoolset-7/enable
-    source /opt/rh/rh-python36/enable
-    ./ci/publish/python/build.sh
-    popd
-}
-
-build_static_python_cpu_cmake() {
-    set -ex
-    pushd .
-    export mxnet_variant=cpu
-    export CMAKE_STATICBUILD=1
-    source /opt/rh/llvm-toolset-7.0/enable
-    source /opt/rh/rh-python36/enable
-    ./ci/publish/python/build.sh
-    popd
-}
-
-build_static_python_cu92_cmake() {
-    set -ex
-    pushd .
-    export mxnet_variant=cu92
-    export CMAKE_STATICBUILD=1
-    export USE_SYSTEM_CUDA=1
     source /opt/rh/devtoolset-7/enable
     source /opt/rh/rh-python36/enable
     ./ci/publish/python/build.sh
@@ -2055,7 +2029,6 @@ publish_scala_build() {
     scala_prepare
     source /opt/rh/llvm-toolset-7.0/enable
     source /opt/rh/rh-maven35/enable
-    export USE_SYSTEM_CUDA=1
     ./ci/publish/scala/build.sh
     popd
 }

@@ -541,11 +541,7 @@ ifeq ($(USE_CUDA), 1)
 			CFLAGS += -I$(USE_NCCL_PATH)/include
 			LDFLAGS += -L$(USE_NCCL_PATH)/lib
 		endif
-		ifdef USE_SYSTEM_CUDA
-		LDFLAGS += -lnccl_static
-		else
 		LDFLAGS += -lnccl
-		endif
 		CFLAGS += -DMXNET_USE_NCCL=1
 	else
 		CFLAGS += -DMXNET_USE_NCCL=0

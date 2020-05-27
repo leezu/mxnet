@@ -149,7 +149,7 @@ if(CMAKE_BUILD_TYPE STREQUAL "Distribution" AND UNIX AND NOT APPLE)
   set(CMAKE_EXE_LINKER_FLAGS "-Wl,--disable-new-dtags")
 endif()
 
-set(CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/upstream;${CMAKE_CURRENT_SOURCE_DIR}/cmake/Modules;${CMAKE_MODULE_PATH}")
+set(CMAKE_MODULE_PATH "${CMAKE_BINARY_DIR};${CMAKE_CURRENT_SOURCE_DIR}/cmake/upstream;${CMAKE_CURRENT_SOURCE_DIR}/cmake/Modules;${CMAKE_MODULE_PATH}")
 
 SET(EXTRA_OPERATORS "" CACHE PATH "EXTRA OPERATORS PATH")
 
@@ -281,7 +281,11 @@ endif()
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src)
 
-include(cmake/ChooseBlas.cmake)
+if((NOT EXISTS ${CMAKE_BINARY_DIR}/conanbuildinfo.txt) OR NOT (USE_BLAS STREQUAL "Open" OR USE_BLAS STREQUAL "open" OR USE_BLAS STREQUAL "openblas"))
+  # ChooseBlas is used if not building OpenBLAS build via Conan. That is handled
+  # separately, as OpenBLAS is provided by Conan.
+  include(cmake/ChooseBlas.cmake)
+endif()
 
 if(USE_ASAN)
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fno-omit-frame-pointer -fsanitize=address")
@@ -327,6 +331,7 @@ endif()
 
 set(ALT_MALLOC_FLAGS "-fno-builtin-malloc -fno-builtin-calloc -fno-builtin-realloc -fno-builtin-free")
 
+if(NOT EXISTS ${CMAKE_BINARY_DIR}/conanbuildinfo.txt)
 # ---[ gperftools
 if(USE_GPERFTOOLS)
   find_package(Gperftools)
@@ -382,6 +387,7 @@ else(USE_OPENCV)
   message(STATUS "OpenCV Disabled")
   add_definitions(-DMXNET_USE_OPENCV=0)
 endif()
+endif()
 
 # ---[ OpenMP
 if(USE_OPENMP)
@@ -402,6 +408,7 @@ if(USE_OPENMP)
   if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/openmp/CMakeLists.txt
      AND SYSTEM_ARCHITECTURE STREQUAL "x86_64"
      AND NOT CMAKE_BUILD_TYPE STREQUAL "Distribution"
+     AND NOT EXISTS ${CMAKE_BINARY_DIR}/conanbuildinfo.txt
      AND NOT BLAS STREQUAL "MKL"
      AND NOT MSVC
      AND NOT CMAKE_CROSSCOMPILING)
@@ -437,7 +444,9 @@ if(USE_LAPACK)
   add_definitions(-DMXNET_USE_LAPACK=1)
   # In the CMAKE_BUILD_TYPE="Distribution" case, we link against Blas libraries
   # that already provide lapack symbols. Thus -llapack would be wrong.
-  if (NOT MSVC AND NOT CMAKE_BUILD_TYPE STREQUAL "Distribution")
+  if (NOT MSVC
+      AND NOT CMAKE_BUILD_TYPE STREQUAL "Distribution"
+      AND NOT EXISTS ${CMAKE_BINARY_DIR}/conanbuildinfo.txt)
     list(APPEND mxnet_LINKER_LIBS lapack)
   endif()
 endif()
@@ -735,6 +744,29 @@ elseif(MSVC)
     add_library(mxnet SHARED ${SOURCE})
     target_compile_definitions(mxnet PUBLIC DMLC_LOG_FATAL_THROW=$<BOOL:${LOG_FATAL_THROW}>)
     target_link_libraries(mxnet PUBLIC mshadow)
+  endif()
+endif()
+
+
+if(EXISTS ${CMAKE_BINARY_DIR}/conanbuildinfo.txt)
+  if(USE_BLAS STREQUAL "Open" OR USE_BLAS STREQUAL "open" OR USE_BLAS STREQUAL "openblas")
+    find_package(OpenBLAS)
+    target_link_libraries(mxnet PUBLIC OpenBLAS::OpenBLAS)
+    target_compile_definitions(mxnet PUBLIC MSHADOW_USE_CBLAS=1)
+    target_compile_definitions(mxnet PUBLIC MSHADOW_USE_MKL=0)
+    target_compile_definitions(mxnet PUBLIC MXNET_USE_BLAS_OPEN=1)
+  endif()
+
+  if(USE_OPENCV)
+    find_package(opencv)
+    target_link_libraries(mxnet PUBLIC opencv::opencv)
+    target_compile_definitions(mxnet PUBLIC MXNET_USE_OPENCV=1)
+  endif()
+
+  if(USE_LIBJPEG_TURBO)
+    find_package(libjpeg-turbo)
+    target_link_libraries(mxnet PUBLIC libjpeg-turbo::libjpeg-turbo)
+    target_compile_definitions(mxnet PUBLIC MXNET_USE_LIBJPEG_TURBO=1)
   endif()
 endif()
 
