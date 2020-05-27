@@ -1,0 +1,78 @@
+name: continuous build
+
+on: [push, pull_request]
+
+jobs:
+  staticbuild:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Compilation cache
+        uses: actions/cache@v2
+        with:
+          path: ~/.ccache
+          # We include the commit sha in the cache key, as new cache entries are
+          # only created if there is no existing entry for the key yet.
+          key: ${{ runner.os }}-ccache-${{ github.sha }}
+          # Restore any ccache cache entry, if none for
+          # ${{ runner.os }}-ccache-${{ github.sha }} exists
+          restore-keys: |
+            ${{ runner.os }}-ccache-
+
+      - name: Dependency cache
+        uses: actions/cache@v2
+        with:
+          path: ~/.conan
+          key: ${{ runner.os }}-conan-${{ hashFiles('**/conanfile.py') }}
+          # We don't use restore-keys for ~/.conan, as there is no automatic
+          # cleanup for the files in ~/.conan and the cache would keep growing.
+          # That means that we re-compile all dependencies whenever the
+          # conanfile changes.
+
+      - name: Setup python
+        uses: actions/setup-python@v2
+        with:
+          python-version: '3.6'
+          architecture: x64
+
+      - name: Install Dependencies
+        run: |
+          if [ "$RUNNER_OS" == "Linux" ]; then
+            sudo apt-get install -y build-essential gfortran git ninja-build ccache cmake
+          elif [ "$RUNNER_OS" == "macOS" ]; then
+            brew install conan nasm automake ninja libtool cmake pkgconfig protobuf hdf5 zlib ccache
+          else
+            echo "$RUNNER_OS not supported"
+            exit 1
+          fi
+          ccache -M 1G  # Limit the ccache size; Github's overall cache limit is 5GB
+          python -m pip install conan cmake
+          python -m pip install -r ci/docker/install/requirements
+        shell: bash
+
+      - name: Build project
+        run: |
+          ./tools/staticbuild/build.sh cpu
+
+      - name: Setup Python
+        run: |
+          python -m pip install --user -e python
+
+      - name: Test project
+        run: |
+          if [ "$RUNNER_OS" == "Linux" ]; then
+            echo Skipping tests on Linux on Github Actions.
+          elif [ "$RUNNER_OS" == "macOS" ]; then
+            python -m pytest -n 4 --durations=50 --verbose tests/python/unittest/ -k 'not test_operator and not (test_subgraph or test_custom_op or test_recordimage_dataset_with_data_loader_multiworker or test_multi_worker or test_multi_worker_shape or test_multi_worker_forked_data_loader or test_multi_worker_dataloader_release_pool)' -m 'not serial'
+            MXNET_ENGINE_TYPE=NaiveEngine python -m pytest -n 4 --durations=50 --verbose tests/python/unittest/ -k 'test_operator and not (test_subgraph or test_custom_op or test_recordimage_dataset_with_data_loader_multiworker or test_multi_worker or test_multi_worker_shape or test_multi_worker_forked_data_loader or test_multi_worker_dataloader_release_pool)' -m 'not serial'
+            python -m pytest --durations=50 --verbose tests/python/unittest/ -k 'not (test_subgraph or test_custom_op or test_recordimage_dataset_with_data_loader_multiworker or test_multi_worker or test_multi_worker_shape or test_multi_worker_forked_data_loader or test_multi_worker_dataloader_release_pool)' -m 'serial'
+          else
+            echo "$RUNNER_OS not supported"
+            exit 1
+          fi

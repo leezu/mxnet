@@ -747,19 +747,6 @@ def compile_static_python_cpu() {
   }]
 }
 
-def compile_static_python_cpu_cmake() {
-  return ['Static build CPU CentOS7 Python with CMake' : {
-    node(NODE_LINUX_CPU) {
-        ws('workspace/ut-publish-python-cpu') {
-          timeout(time: max_time, unit: 'MINUTES') {
-            utils.init_git()
-            utils.docker_run('centos7_cpu', 'build_static_python_cpu_cmake', false)
-          }
-        }
-    }
-  }]
-}
-
 def compile_static_python_gpu() {
   return ['Static build GPU CentOS7 Python' : {
     node(NODE_LINUX_GPU) {
@@ -767,19 +754,6 @@ def compile_static_python_gpu() {
           timeout(time: max_time, unit: 'MINUTES') {
             utils.init_git()
             utils.docker_run('centos7_gpu_cu92', 'build_static_python_cu92')
-          }
-        }
-    }
-  }]
-}
-
-def compile_static_python_gpu_cmake() {
-  return ['Static build GPU CentOS7 Python with CMake' : {
-    node(NODE_LINUX_GPU) {
-        ws('workspace/ut-publish-python-gpu') {
-          timeout(time: max_time, unit: 'MINUTES') {
-            utils.init_git()
-            utils.docker_run('centos7_gpu_cu92', 'build_static_python_cu92_cmake')
           }
         }
     }
