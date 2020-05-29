@@ -60,8 +60,6 @@ class MxnetConan(ConanFile):
         "cuda": False,
         "dnnl": True,
         # Default options for dependencies
-        "openblas:build_lapack": True,
-        "openblas:dynamic_arch": True,
         "opencv:eigen": True,
         "opencv:openblas": True,
         "opencv:fPIC": True,
