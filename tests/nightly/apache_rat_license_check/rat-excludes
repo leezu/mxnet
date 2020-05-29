@@ -24,6 +24,9 @@ clipboard.js
 # Includes
 _includes/*
 
+# conan recipes
+tools/staticbuild/conan/recipes/openblas/*
+
 # Other
 \..*
 .*css

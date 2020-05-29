@@ -309,6 +309,8 @@
          Licensed MIT © Zeno Rocha
     11. mx-theme - For details, see docs/python_docs/themes/mx-theme/LICENSE
          Copyright (c) 2016 myyasuda
+    12. conan-openblas - For details, see tools/staticbuild/conan/recipes/opencv/LICENSE
+         Copyright (c) 2017-2019 JFrog LTD
 
 
     =======================================================================================

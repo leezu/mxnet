@@ -70,7 +70,7 @@ zip -r - conan/settings.yml > $tmpfile  # zip the settings.yml
 conan config install $tmpfile
 
 # Register local conan recipes
-conan export conan/recipes/openblas
+conan export tools/staticbuild/conan/recipes/openblas
 
 # Build libmxnet.so
 rm -rf build; mkdir build; cd build
