@@ -26,6 +26,7 @@ _includes/*
 
 # conan recipes
 tools/staticbuild/conan/recipes/openblas/*
+tools/staticbuild/conan/recipes/opencv/*
 
 # Other
 \..*

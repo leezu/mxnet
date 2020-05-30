@@ -66,6 +66,7 @@ class MxnetConan(ConanFile):
         "opencv:jpeg": True,
         "opencv:jpegturbo": True,
         "opencv:png": True,
+        "opencv:opencl": False,
         "opencv:protobuf": False,
         "opencv:shared": False,
         "opencv:contrib": False,
@@ -90,7 +91,7 @@ class MxnetConan(ConanFile):
 
     def requirements(self):
         if self.options.opencv:
-           self.requires("opencv/4.1.1@conan/stable")
+           self.requires("opencv/4.1.1")
         if self.options.jpegturbo:
            self.requires("libjpeg-turbo/2.0.4", override=True)
         if self.options.blas == "openblas":
