@@ -17,6 +17,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
+set -ex
+
 if [ $# -lt 1 ]; then
     >&2 echo "Usage: build.sh <VARIANT>"
 fi

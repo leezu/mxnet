@@ -29,7 +29,7 @@
 #include "./base.h"
 
 #if MSHADOW_USE_F16C
-  #include <x86intrin.h>
+#include <immintrin.h>
 #endif  // MSHADOW_USE_F16C
 
 // This flag dictates rounding for the float2half() routine only (used generally on Windows),

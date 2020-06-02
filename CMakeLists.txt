@@ -55,7 +55,7 @@ cmake_dependent_option(USE_NVML "Build with nvml support if found" ON "USE_CUDA"
 cmake_dependent_option(USE_CUDNN "Build with cudnn support" ON "USE_CUDA" OFF) # one could set CUDNN_ROOT for search path
 cmake_dependent_option(USE_NVTX "Build with nvtx support if found" ON "USE_CUDA" OFF)
 cmake_dependent_option(USE_SSE "Build with x86 SSE instruction support" ON "NOT ARM" OFF)
-option(USE_F16C "Build with x86 F16C instruction support" ON) # autodetects support if ON
+option(USE_F16C "Build with x86 F16C instruction support. NOTE: THIS WILL COMMONLY ENABLE AVX2 and AVX512 INSTRUCTIONS AS WELL DUE TO COMPILER BUGS" ON) # autodetects support if ON
 option(USE_LAPACK "Build with lapack support" ON)
 option(USE_MKL_IF_AVAILABLE "Use MKL if found" ON)
 if(USE_MKL_IF_AVAILABLE AND (NOT APPLE) AND (NOT MSVC) AND (CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "x86_64") AND (NOT CMAKE_CROSSCOMPILING))
