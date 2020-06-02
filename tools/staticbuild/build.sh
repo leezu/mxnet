@@ -17,6 +17,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
+set -ex
+
 if [ $# -lt 1 ]; then
     >&2 echo "Usage: build.sh <VARIANT>"
 fi
@@ -51,15 +53,15 @@ fi
 git submodule update --init --recursive || true
 
 # Check usage of correct C++ ABI
-conan profile new default --detect || true  # Generate conan default profile if it does not exist already
-if [[ $(conan profile get settings.compiler default) == 'gcc' &&
-          $(conan profile get settings.compiler.version default) -ge 5 &&
-          $(conan profile get settings.compiler.libcxx default) == 'libstdc++' ]]; then
-    echo "WARNING: You are using GCC>=5 but targeting the old libstdc++ ABI. This is not supported for building MXNet."
-    echo "We updated your default profile to target the libstdc++11 ABI."
-    echo "See https://docs.conan.io/en/latest/howtos/manage_gcc_abi.html for more information"
-    conan profile update settings.compiler.libcxx=libstdc++11 default
-fi;
+# conan profile new default --detect || true  # Generate conan default profile if it does not exist already
+# if [[ $(conan profile get settings.compiler default) == 'gcc' &&
+#           $(conan profile get settings.compiler.version default) -ge 5 &&
+#           $(conan profile get settings.compiler.libcxx default) == 'libstdc++' ]]; then
+#     echo "WARNING: You are using GCC>=5 but targeting the old libstdc++ ABI. This is not supported for building MXNet."
+#     echo "We updated your default profile to target the libstdc++11 ABI."
+#     echo "See https://docs.conan.io/en/latest/howtos/manage_gcc_abi.html for more information"
+#     conan profile update settings.compiler.libcxx=libstdc++11 default
+# fi;
 
 # Deploy an extended settings.yml introducing os.force_build_from_source to
 # prevent conan from downloading pre-built artifacts (for which we have no
@@ -75,7 +77,7 @@ conan export tools/staticbuild/conan/recipes/opencv
 
 # Build libmxnet.so
 rm -rf build; mkdir build; cd build
-conan install .. ${options} -s os.force_build_from_source=True --build missing
+conan install .. ${options} -s os.force_build_from_source=True --build missing -s compiler=clang
 conan build ..  # build mxnet
 cd -
 

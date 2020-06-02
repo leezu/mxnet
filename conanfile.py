@@ -41,14 +41,11 @@ class MxnetConan(ConanFile):
         "cuda": [True, False],
         "dnnl": [True, False],
         "blas": ["openblas", "apple", "mkl", "atlas"],
+        "s3": [True, False],
+        "f16c": [True, False],
+        "dist_kvstore": [True, False],
     }
     generators = "cmake_find_package"
-    requires = (
-        "OpenSSL/1.1.1@conan/stable",
-        "protobuf/3.11.4",
-        "zeromq/4.3.2",
-        ("zlib/1.2.11@conan/stable", "override"),
-    )
     default_options = {
         # Default options for MXNet
         "shared": False,  # Only affects BUILD_SHARED_LIBS and thus libdmlc but
@@ -59,6 +56,9 @@ class MxnetConan(ConanFile):
         "jpegturbo": True,
         "cuda": False,
         "dnnl": True,
+        "s3": False,
+        "f16c": True,
+        "dist_kvstore": False,
         # Default options for dependencies
         "opencv:eigen": True,
         "opencv:openblas": True,
@@ -89,13 +89,24 @@ class MxnetConan(ConanFile):
         "zeromq:encryption": None,  # No libsodium
     }
 
+    def package_info(self):
+        self.cpp_info.cflags = ["-mno-avx"]
+        self.cpp_info.cxxflags = ["-mno-avx"]
+
     def requirements(self):
         if self.options.opencv:
-           self.requires("opencv/4.1.1")
+            self.requires("opencv/4.1.1")
         if self.options.jpegturbo:
-           self.requires("libjpeg-turbo/2.0.4", override=True)
+            self.requires("libjpeg-turbo/2.0.4", override=True if self.options.opencv else False)
         if self.options.blas == "openblas":
-           self.requires("openblas/4a4c50a7cef9fa91f14e508722f502d956ad5192", override=True)
+            self.requires("openblas/4a4c50a7cef9fa91f14e508722f502d956ad5192",
+                          override=True if self.options.opencv else False)
+        if self.options.s3:
+            self.requires("OpenSSL/1.1.1@conan/stable")
+        if self.options.dist_kvstore:
+            self.requires("protobuf/3.11.4")
+            self.requires("zeromq/4.3.2")
+            self.requires("zlib/1.2.11@conan/stable", override=True)
 
     def build(self):
         cmake = CMake(self)
@@ -111,6 +122,9 @@ class MxnetConan(ConanFile):
         cmake.definitions["USE_LAPACK"] = self.options["openblas"].build_lapack
         cmake.definitions["USE_CUDA"] = self.options.cuda
         cmake.definitions["USE_MKLDNN"] = self.options.dnnl
+        cmake.definitions["USE_DIST_KVSTORE"] = self.options.dist_kvstore
+        cmake.definitions["USE_S3"] = self.options.s3
+        cmake.definitions["USE_F16C"] = self.options.f16c
 
         cmake.configure()
         cmake.build()
