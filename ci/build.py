@@ -199,6 +199,7 @@ def container_run(docker_client: SafeDockerClient,
                   docker_registry: str,
                   shared_memory_size: str,
                   local_ccache_dir: str,
+                  local_conan_dir: str,
                   command: List[str],
                   environment: Dict[str, str],
                   dry_run: bool = False) -> int:
@@ -212,6 +213,8 @@ def container_run(docker_client: SafeDockerClient,
         'CCACHE_TEMPDIR': '/tmp/ccache',  # temp dir should be local and not shared
         'CCACHE_DIR': '/work/ccache',  # this path is inside the container as /work/ccache is
                                        # mounted
+        'CONAN_DIR': '/work/conan',  # this path is inside the container as /work/ccache is
+                                       # mounted
         'CCACHE_LOGFILE': '/tmp/ccache.log',  # a container-scoped log, useful for ccache
                                               # verification.
     })
@@ -224,6 +227,8 @@ def container_run(docker_client: SafeDockerClient,
     os.makedirs(local_build_folder, exist_ok=True)
     os.makedirs(local_ccache_dir, exist_ok=True)
     logging.info("Using ccache directory: %s", local_ccache_dir)
+    os.makedirs(local_conan_dir, exist_ok=True)
+    logging.info("Using conan directory: %s", local_conan_dir)
 
     # Equivalent command
     docker_cmd_list = [
@@ -239,6 +244,7 @@ def container_run(docker_client: SafeDockerClient,
         # mount mxnet/build for storing build
         '-v', "{}:/work/build".format(local_build_folder),
         '-v', "{}:/work/ccache".format(local_ccache_dir),
+        '-v', "{}:/work/conan".format(local_conan_dir),
         '-u', '{}:{}'.format(os.getuid(), os.getgid()),
         '-e', 'CCACHE_MAXSIZE={}'.format(environment['CCACHE_MAXSIZE']),
         # temp dir should be local and not shared
