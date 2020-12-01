@@ -132,7 +132,7 @@ if __name__ == "__main__":
     for operator_def in __OP_DEF__:
         for sch, args, name in operator_def.invoke_all():
             name = operator_def.get_op_name(name, args)
-            if tvm.module.enabled(get_target(operator_def.target)):
+            if tvm.runtime.module.enabled(get_target(operator_def.target)):
                 func_list = func_list_llvm if operator_def.target == "cpu" else func_list_cuda
                 func_lower = tvm.lower(sch, args,
                                        name=name,
